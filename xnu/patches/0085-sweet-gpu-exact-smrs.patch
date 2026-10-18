@@ -1,0 +1,102 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -258,8 +258,11 @@
+ 
+ #define GMU_CB                  0
+ #define GMU_ASID                (GMU_CB + 1)            /* arm_smmu_init_asid, not dynamic */
+-#define GMU_SMR_IDX             0
+-#define GMU_SID                 4                       /* SMR id 4 mask 1: gmu_user 4, gmu_kernel 5 */
++#define GMU_SMR_IDX             0                       /* SMR 0: gmu_kernel, SMR 1: gmu_user */
++#define GMU_SID_KERNEL          5                       /* DT gmu_kernel iommus */
++#define GMU_SID_USER            4                       /* DT gmu_user iommus */
++#define GMU_SID_UNUSED          7                       /* 0085 probe only */
++#define S2CR_FAULT              (2u << 16)
+ #define CBA2R_RW64_64BIT        1u
+ #define CBAR_S1_BYPASS_S2       ((1u << 16) | (3u << 8) | (0xfu << 12))   /* S1 trans, NSH, WB */
+ #define TTBCR_GMU               ((2u << 12) | (0u << 10) | (0u << 8) | (0u << 14) | (1u << 23) | 32u)
+@@ -750,6 +753,24 @@
+ 
+ enum { SMMU_FAILED, SMMU_UNROUTED, SMMU_ROUTED };
+ 
++/*
++ * arm_smmu_write_sme (S2CR, then SMR), then read both back with the
++ * global fault status, which reports configuration faults (GCFGFRE).
++ */
++static void
++smmu_write_sme(vm_offset_t smmu, unsigned idx, uint32_t s2cr, uint32_t smr, const char *what)
++{
++	uint32_t gfsr0 = gpu_rd(smmu, SMMU_sGFSR);
++
++	gpu_wr(smmu, SMMU_sGFSR, gfsr0);                       /* write 1 to clear */
++	gpu_wr(smmu, SMMU_S2CR(idx), s2cr);
++	gpu_wr(smmu, SMMU_SMR(idx), smr);
++	uint32_t gfsr = gpu_rd(smmu, SMMU_sGFSR);
++	printf("SWEET GPU: SMR%u (%s) wrote S2CR 0x%08x SMR 0x%08x, reads S2CR 0x%08x SMR 0x%08x; sGFSR 0x%08x -> 0x%08x sGFSYNR0 0x%08x\n",
++	    idx, what, s2cr, smr, gpu_rd(smmu, SMMU_S2CR(idx)), gpu_rd(smmu, SMMU_SMR(idx)),
++	    gfsr0, gfsr, gpu_rd(smmu, SMMU_sGFSYNR0));
++}
++
+ /* Context bank GMU_CB translating stream IDs 4 and 5 through the gmem tables. */
+ static int
+ gpu_smmu_setup(void)
+@@ -760,8 +781,9 @@
+ 		return SMMU_FAILED;
+ 	}
+ 	if (gpu_rd(smmu, SMMU_CB(GMU_CB) + SMMU_CB_SCTLR) != 0 ||
+-	    (gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX)) & SMR_VALID)) {
+-		printf("SWEET GPU: SMMU CB%u / SMR%u already in use; not touched\n", GMU_CB, GMU_SMR_IDX);
++	    ((gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX)) | gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX + 1)) |
++	    gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX + 2))) & SMR_VALID)) {
++		printf("SWEET GPU: SMMU CB%u / SMR%u-%u already in use; not touched\n", GMU_CB, GMU_SMR_IDX, GMU_SMR_IDX + 2);
+ 		return SMMU_FAILED;
+ 	}
+ 	/* qsmmuv2_device_reset: impl-defs while the micro-MMU is halted. */
+@@ -797,21 +819,37 @@
+ 	}
+ 	gpu_wr(cb, SMMU_CB_SCTLR, SCTLR_GMU);
+ 
+-	/* arm_smmu_write_sme: the S2CR before the SMR becomes valid. */
+-	gpu_wr(smmu, SMMU_S2CR(GMU_SMR_IDX), S2CR_TRANS_CB(GMU_CB));
+-	gpu_wr(smmu, SMMU_SMR(GMU_SMR_IDX), SMR_VALID | (1u << 16) | GMU_SID);
++	printf("SWEET GPU: SMMU CB%u: SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%08x%08x MAIR0 0x%08x\n",
++	    GMU_CB, gpu_rd(cb, SMMU_CB_SCTLR), gpu_rd(cb, SMMU_CB_TCR), gpu_rd(cb, SMMU_CB_TTBCR2),
++	    gpu_rd(cb, SMMU_CB_TTBR0 + 4), gpu_rd(cb, SMMU_CB_TTBR0), gpu_rd(cb, SMMU_CB_MAIR0));
++
++	/*
++	 * One exact entry per stream ID, mask 0, as Linux makes them for the DT
++	 * iommus = <&kgsl_smmu 5> (gmu_kernel) and <&kgsl_smmu 4> (gmu_user).
++	 * 0084: a VALID SMR with id 4 mask 1 read back 0 although the same
++	 * SMRs keep ID/MASK values written without VALID.
++	 */
++	static const uint32_t sids[] = { GMU_SID_KERNEL, GMU_SID_USER };
++	bool routed = true;
++	for (unsigned i = 0; i < sizeof(sids) / sizeof(sids[0]); i++) {
++		uint32_t want = SMR_VALID | sids[i];
++		smmu_write_sme(smmu, GMU_SMR_IDX + i, S2CR_TRANS_CB(GMU_CB), want, "GMU");
++		routed &= gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX + i)) == want;
++	}
++	if (!routed) {
++		/* Does any VALID SMR stick? An unused ID whose S2CR faults routes nothing. */
++		unsigned probe = GMU_SMR_IDX + 2;
++		uint32_t s2cr0 = gpu_rd(smmu, SMMU_S2CR(probe));
++		smmu_write_sme(smmu, probe, S2CR_FAULT, SMR_VALID | GMU_SID_UNUSED, "probe");
++		gpu_wr(smmu, SMMU_SMR(probe), 0);
++		gpu_wr(smmu, SMMU_S2CR(probe), s2cr0);
++	}
+ 	gpu_wr(smmu, SMMU_TLBIALLNSNH, 0);
+ 	if (!smmu_sync(smmu, SMMU_sTLBGSYNC, SMMU_sTLBGSTATUS)) {
+ 		return SMMU_FAILED;
+ 	}
+-	printf("SWEET GPU: SMMU CB%u: SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%08x%08x MAIR0 0x%08x; SMR%u 0x%08x S2CR 0x%08x\n",
+-	    GMU_CB, gpu_rd(cb, SMMU_CB_SCTLR), gpu_rd(cb, SMMU_CB_TCR), gpu_rd(cb, SMMU_CB_TTBCR2),
+-	    gpu_rd(cb, SMMU_CB_TTBR0 + 4), gpu_rd(cb, SMMU_CB_TTBR0), gpu_rd(cb, SMMU_CB_MAIR0), GMU_SMR_IDX,
+-	    gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX)), gpu_rd(smmu, SMMU_S2CR(GMU_SMR_IDX)));
+-	uint32_t smr = gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX));
+-	if (smr != (SMR_VALID | (1u << 16) | GMU_SID)) {
+-		printf("SWEET GPU: SMR%u reads 0x%08x, not the 0x%08x written: GMU streams are not routed\n",
+-		    GMU_SMR_IDX, smr, SMR_VALID | (1u << 16) | GMU_SID);
++	if (!routed) {
++		printf("SWEET GPU: VALID SMRs for the GMU stream IDs do not stick: GMU streams are not routed\n");
+ 		return SMMU_UNROUTED;
+ 	}
+ 	return SMMU_ROUTED;
