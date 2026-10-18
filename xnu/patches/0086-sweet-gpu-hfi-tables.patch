@@ -1,0 +1,313 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -355,4 +355,83 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Read-only: the RPMh address and VLVL table (cmd-db aux data, one u16 per
++ * level, zero padded) of an ARC resource such as "gfx.lvl", for the GPU's
++ * GMU (sweet_gpu.c), like Linux cmd_db_read_addr + cmd_db_read_aux_data.
++ * *num counts levels as KGSL rpmh_arc_cmds does. Sends nothing to RPMh.
++ */
++#define RH_ARC          3u
++int sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
++    unsigned *num, uint32_t *address);
++
++int
++sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
++    unsigned *num, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	unsigned matches = 0, len = 0;
++
++	if (!res || !vals || !num || !address || max == 0) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	if (error) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			error = EINVAL;
++			goto out;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16), off = aux + rh_db16(e + 22);
++			len = rh_db16(e + 20);
++			if (slave != RH_ARC || (addr >> 16) != RH_ARC || (len & 1u) || !rh_range(off, len)) {
++				printf("SWEET RPMH: invalid ARC entry for %s\n", res);
++				error = EINVAL;
++				goto out;
++			}
++			for (unsigned k = 0; k < max; ++k) {
++				vals[k] = k < len / 2 ? rh_db16(off + 2 * k) : 0;
++			}
++			*address = addr;
++			++matches;
++		}
++	}
++	if (matches != 1 || len < 2) {
++		printf("SWEET RPMH: %s ARC lookup matches=%u len=%u; refusing\n", res, matches, len);
++		error = ENODEV;
++		goto out;
++	}
++	for (*num = 1; *num < MIN(len / 2, max); ++*num) {
++		if (vals[*num - 1] != 0 && vals[*num] == 0) {
++			break;
++		}
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -32,6 +32,9 @@
+  *               routes the GMU stream IDs does not read back valid (0083:
+  *               it read 0 and the phone reset without a panic soon after
+  *               the boot, before the next log flush).
++ *               After H2F_MSG_FW_VER the rest of the v1 hfi_start follows:
++ *               the GX/CX DCVS table (cmd-db ARC levels, fused speed bin),
++ *               a bandwidth table without RPMh commands, H2F_MSG_TEST.
+  *   sweetgpu=5  4, but goes on without a valid SMR, to reproduce that reset;
+  *               the console log is flushed (sweet_log_sync) before each step.
+  */
+@@ -50,6 +53,8 @@
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_log_sync(void);       /* sweet_ufs.c */
++extern int sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
++    unsigned *num, uint32_t *address);  /* sweet_rpmh.c */
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA                  0x00100000
+@@ -348,6 +353,49 @@
+ #define HFI_RSP_TIMEOUT_US      100000
+ #define GMU_COLD_BOOT           1
+ #define GMU_FW_VERSION_1_8      0x10080000u     /* GMU_VERSION(gpmu_major 1, gpmu_minor 8) */
++#define H2F_MSG_BW_VOTE_TBL     3
++#define H2F_MSG_PERF_TBL        4
++#define H2F_MSG_TEST            5
++
++/*
++ * DCVS levels (hfi_send_dcvstbl_v1). GPU frequencies per speed bin from the
++ * DT qcom,gpu-pwrlevels-N, ascending as KGSL orders gmu->gpu_freqs (index 0
++ * is the 0 Hz level); the bin is fuse QFPROM 0x780000 + 0x41a0, mask
++ * 0x1fe00000 >> 21 (DT qcom,gpu-speed-bin). VLVL = the gpucc-sdmmagpie
++ * vdd_gx corner whose rate_max covers the frequency; the GMU's levels
++ * are DT qcom,gmu-pwrlevels (0, 200 MHz at VDD_MIN = MIN_SVS).
++ */
++#define QFPROM_PA               0x00780000
++#define QFPROM_SIZE             0x00006300
++#define QFPROM_GPU_SPEED_BIN    0x41a0
++#define MAX_GX_LEVELS           16              /* hfi_dcvstable_v1_cmd */
++#define MAX_CX_LEVELS           4
++#define PERF_TBL_DW             (3 + 2 * MAX_GX_LEVELS + 2 * MAX_CX_LEVELS)
++#define BW_TBL_DW               (6 + 6 + 2 * 6 + 8 + MAX_GX_LEVELS * 8)  /* hfi_bwtable_cmd */
++#define ARC_VOTE(pri, sec, vlvl) ((((vlvl) & 0xffffu) << 16) | (((sec) & 0xffu) << 8) | ((pri) & 0xffu))
++
++static const struct {
++	uint32_t bin;
++	unsigned n;
++	uint16_t mhz[MAX_GX_LEVELS];
++} gpu_bins[] = {
++	{ 0x00, 9, { 0, 180, 267, 355, 430, 565, 650, 800, 825 } },
++	{ 0xac, 9, { 0, 180, 267, 355, 430, 565, 650, 800, 825 } },
++	{ 0x92, 8, { 0, 180, 267, 355, 430, 565, 650, 700 } },
++	{ 0x80, 7, { 0, 180, 267, 355, 430, 565, 610 } },
++	{ 0xa7, 8, { 0, 180, 267, 355, 430, 565, 650, 800 } },
++};
++
++/* gx_gfx3d rate_max per vdd_gx corner, with the corner's RPMh VLVL (level - offset 1). */
++static const struct {
++	uint16_t mhz, vlvl;
++} gx_corners[] = {
++	{ 180, 48 }, { 267, 64 }, { 355, 128 }, { 430, 192 },
++	{ 565, 256 }, { 650, 320 }, { 800, 384 }, { 825, 416 },
++};
++
++static uint32_t gx_votes[MAX_GX_LEVELS], cx_votes[MAX_CX_LEVELS];
++static unsigned gx_levels;
+ 
+ #define A6XX_RBBM_STATUS        0x210
+ #define A6XX_CP_SQE_INSTR_BASE_LO 0x830
+@@ -1024,6 +1072,145 @@
+ 	    gm_rd(GMEM_DUMP), gm_rd(GMEM_DUMP + 4), gm_rd(GMEM_DUMP + 8), gm_rd(GMEM_DUMP + 12), gm_rd(GMEM_DUMMY));
+ }
+ 
++static unsigned
++gx_vlvl(unsigned mhz)
++{
++	if (mhz == 0) {
++		return 0;                       /* KGSL hardcodes VLVL 0 for the 0 Hz level */
++	}
++	for (unsigned i = 0; i < sizeof(gx_corners) / sizeof(gx_corners[0]); i++) {
++		if (mhz <= gx_corners[i].mhz) {
++			return gx_corners[i].vlvl;
++		}
++	}
++	return 0xffff;
++}
++
++/*
++ * setup_volt_dependency_tbl: for each level, the first primary-rail ARC
++ * index whose VLVL covers it, and the first secondary (MX) index at or
++ * above that VLVL (else the last one).
++ */
++static bool
++arc_vote_tbl(const char *what, const uint16_t *pri, unsigned npri, const uint16_t *sec, unsigned nsec,
++    const unsigned *vlvl, unsigned n, uint32_t *votes)
++{
++	for (unsigned i = 0; i < n; i++) {
++		unsigned k, j;
++		for (k = 0; k < npri && pri[k] < vlvl[i]; k++) {
++		}
++		if (k == npri) {
++			printf("SWEET GPU: %s level %u: VLVL %u above the %u ARC levels\n", what, i, vlvl[i], npri);
++			return false;
++		}
++		for (j = 0; j < nsec; j++) {
++			if (sec[j] >= pri[k] || j + 1 == nsec) {
++				break;
++			}
++		}
++		votes[i] = ARC_VOTE(k, j == nsec ? 0 : j, pri[k]);
++	}
++	return true;
++}
++
++/* The ARC tables from cmd-db and the GX/CX DCVS votes for the fused speed bin. */
++static bool
++gpu_dcvs_votes(uint32_t *gx_khz, uint32_t *cx_khz)
++{
++	static const char *const arcs[] = { "gfx.lvl", "mx.lvl", "cx.lvl" };
++	uint16_t lvl[3][MAX_GX_LEVELS];
++	unsigned num[3], gx_vl[MAX_GX_LEVELS], cx_vl[MAX_CX_LEVELS] = { 0, 48 };
++	uint32_t addr[3];
++	vm_offset_t qfprom = ml_io_map(QFPROM_PA, QFPROM_SIZE);
++
++	if (qfprom == 0) {
++		return false;
++	}
++	uint32_t fuse = gpu_rd(qfprom, QFPROM_GPU_SPEED_BIN), bin = (fuse & 0x1fe00000u) >> 21;
++	unsigned b;
++	for (b = 0; b < sizeof(gpu_bins) / sizeof(gpu_bins[0]) && gpu_bins[b].bin != bin; b++) {
++	}
++	if (b == sizeof(gpu_bins) / sizeof(gpu_bins[0])) {
++		printf("SWEET GPU: speed bin 0x%x (fuse 0x%08x) not in the DT; no DCVS table\n", bin, fuse);
++		return false;
++	}
++	gx_levels = gpu_bins[b].n;
++	printf("SWEET GPU: speed bin 0x%x (fuse 0x%08x): %u GPU levels, top %u MHz\n",
++	    bin, fuse, gx_levels, gpu_bins[b].mhz[gx_levels - 1]);
++	for (unsigned a = 0; a < 3; a++) {
++		int error = sweet_rpmh_arc_levels(arcs[a], lvl[a], MAX_GX_LEVELS, &num[a], &addr[a]);
++		if (error) {
++			printf("SWEET GPU: cmd-db %s: error %d\n", arcs[a], error);
++			return false;
++		}
++		/* The 0081 PDC TCS commands use 0x30000, 0x30010 and 0x30090 (KGSL, unnamed). */
++		printf("SWEET GPU: cmd-db %s addr 0x%05x%s, %u levels: %u %u %u %u %u %u %u %u %u %u %u %u\n",
++		    arcs[a], addr[a], (addr[a] == 0x30000 || addr[a] == 0x30010 || addr[a] == 0x30090) ?
++		    " (one of the PDC TCS addresses)" : " (NOT a PDC TCS address)", num[a],
++		    lvl[a][0], lvl[a][1], lvl[a][2], lvl[a][3], lvl[a][4], lvl[a][5],
++		    lvl[a][6], lvl[a][7], lvl[a][8], lvl[a][9], lvl[a][10], lvl[a][11]);
++	}
++	for (unsigned i = 0; i < gx_levels; i++) {
++		gx_vl[i] = gx_vlvl(gpu_bins[b].mhz[i]);
++		gx_khz[i] = gpu_bins[b].mhz[i] * 1000u;
++	}
++	cx_khz[0] = 0;
++	cx_khz[1] = 200000;
++	if (!arc_vote_tbl("GX", lvl[0], num[0], lvl[1], num[1], gx_vl, gx_levels, gx_votes) ||
++	    !arc_vote_tbl("CX", lvl[2], num[2], lvl[1], num[1], cx_vl, 2, cx_votes)) {
++		return false;
++	}
++	for (unsigned i = 0; i < gx_levels; i++) {
++		printf("SWEET GPU: GX level %u: %u MHz VLVL %u -> vote 0x%08x (gfx %u, mx %u)\n", i,
++		    gpu_bins[b].mhz[i], gx_vl[i], gx_votes[i], gx_votes[i] & 0xff, (gx_votes[i] >> 8) & 0xff);
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		printf("SWEET GPU: CX level %u: %u MHz VLVL %u -> vote 0x%08x\n", i, cx_khz[i] / 1000, cx_vl[i], cx_votes[i]);
++	}
++	return true;
++}
++
++/*
++ * The rest of hfi_start for v1 firmware with the HFI_USE_REG quirk:
++ * DCVS table, bandwidth table, then H2F_MSG_TEST ("no more HFI until the
++ * next boot"). The bandwidth table has no RPMh commands yet: KGSL's comes
++ * from the msm_bus BCM votes, so the GMU votes no DDR/CNOC bandwidth
++ * (the CPU's votes keep DDR up).
++ */
++static bool
++gpu_hfi_tables(uint32_t *ack)
++{
++	uint32_t gx_khz[MAX_GX_LEVELS] = { 0 }, cx_khz[MAX_CX_LEVELS] = { 0 };
++	uint32_t m[BW_TBL_DW > PERF_TBL_DW ? BW_TBL_DW : PERF_TBL_DW];
++
++	if (!gpu_dcvs_votes(gx_khz, cx_khz)) {
++		return false;
++	}
++	bzero(m, sizeof(m));
++	m[0] = MSG_HDR(H2F_MSG_PERF_TBL, PERF_TBL_DW, 0);
++	m[1] = gx_levels;
++	m[2] = 2;
++	for (unsigned i = 0; i < gx_levels; i++) {
++		m[3 + 2 * i] = gx_votes[i];
++		m[4 + 2 * i] = gx_khz[i];
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		m[3 + 2 * MAX_GX_LEVELS + 2 * i] = cx_votes[i];
++		m[4 + 2 * MAX_GX_LEVELS + 2 * i] = cx_khz[i];
++	}
++	if (!hfi_cmd("H2F_MSG_PERF_TBL", m, PERF_TBL_DW, ack, 19)) {
++		return false;
++	}
++	bzero(m, sizeof(m));
++	m[0] = MSG_HDR(H2F_MSG_BW_VOTE_TBL, BW_TBL_DW, 0);
++	m[1] = 1;                               /* bw_level_num; cnoc/ddr cmds 0, wait masks 0 */
++	if (!hfi_cmd("H2F_MSG_BW_VOTE_TBL", m, BW_TBL_DW, ack, 19)) {
++		return false;
++	}
++	uint32_t test[2] = { MSG_HDR(H2F_MSG_TEST, 2, 0), 0 };
++	return hfi_cmd("H2F_MSG_TEST", test, 2, ack, 19);
++}
++
+ /* a6xx_gmu_hfi_start, then hfi_start up to the firmware version check. */
+ static void
+ gpu_hfi_start(void)
+@@ -1055,6 +1242,9 @@
+ 		if (hfi_cmd("H2F_MSG_FW_VER", fwver, 2, ack, 19)) {
+ 			printf("SWEET GPU: GMU firmware version 0x%08x: %u.%u step %u (KGSL wants 1.8)\n",
+ 			    ack[3], ack[3] >> 28, (ack[3] >> 16) & 0xfff, ack[3] & 0xffff);
++			if (gpu_hfi_tables(ack)) {
++				printf("SWEET GPU: HFI start complete (DCVS, BW, TEST acknowledged)\n");
++			}
+ 		}
+ 	}
+ 	gpu_smmu_cb_faults();
