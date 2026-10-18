@@ -1,0 +1,230 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -684,6 +684,8 @@
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
++static uint64_t _Atomic sweet_log_flushed;      /* total at the last completed flush */
++static bool sweet_log_running;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+@@ -782,9 +784,33 @@
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+ 			printf("SWEET LOG: write failed (%d), stopping\n", error);
++			sweet_log_running = false;
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, release);
++		wakeup(&sweet_log_flushed);
++	}
++}
++
++/*
++ * Flush the log now and wait (at most 2 s) until everything printed so far
++ * is on the disk: for drivers about to do something that may reset the
++ * phone without a panic. Thread context only; returns at once otherwise.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	uint64_t want = os_atomic_load(&sweet_log_total, relaxed);
++
++	if (!sweet_log_running || get_preemption_level() != 0) {
++		return;
++	}
++	wakeup(&sweet_log_chan);
++	for (int i = 0; i < 20 && os_atomic_load(&sweet_log_flushed, acquire) < want; i++) {
++		(void)tsleep(&sweet_log_flushed, PZERO, "sweetlogsync", MAX(hz / 10, 1));
+ 	}
+ }
+ 
+@@ -803,6 +829,7 @@
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		sweet_log_running = true;
+ 		thread_deallocate(thread);
+ 	}
+ }
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -28,7 +28,12 @@
+  *               allocates: dummy page, HFI queues, crash dump, log), the HFI
+  *               queue table, cold-boot it, start HFI and exchange the first
+  *               messages (H2F_MSG_INIT, H2F_MSG_FW_VER), then hold the GMU
+- *               in reset again.
++ *               in reset again. Stops before the boot when the SMR that
++ *               routes the GMU stream IDs does not read back valid (0083:
++ *               it read 0 and the phone reset without a panic soon after
++ *               the boot, before the next log flush).
++ *   sweetgpu=5  4, but goes on without a valid SMR, to reproduce that reset;
++ *               the console log is flushed (sweet_log_sync) before each step.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -44,6 +49,7 @@
+ /* osfmk/vm/pmap.h, MACH_KERNEL_PRIVATE */
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_log_sync(void);       /* sweet_ufs.c */
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA                  0x00100000
+@@ -715,30 +721,62 @@
+ 	return true;
+ }
+ 
++/*
++ * arm_smmu_test_smr_masks on every SMR: the ID field, then the MASK field,
++ * written without SMR_VALID (no stream is matched) and read back, then 0.
++ * Linux depends on this readback on this SMMU, so SMRs that stay 0 here
++ * mean something else owns them.
++ */
++static void
++gpu_smmu_smr_test(vm_offset_t smmu)
++{
++	unsigned nsmr = gpu_rd(smmu, SMMU_IDR0) & 0xff;
++
++	for (unsigned i = 0; i < nsmr && SMMU_S2CR(i) < SMMU_PAGE; i++) {
++		uint32_t before = gpu_rd(smmu, SMMU_SMR(i)), id, mask;
++		if (before & SMR_VALID) {
++			printf("SWEET GPU: SMR%u in use (0x%08x); not tested\n", i, before);
++			continue;
++		}
++		gpu_wr(smmu, SMMU_SMR(i), 0x7fffu);
++		id = gpu_rd(smmu, SMMU_SMR(i));
++		gpu_wr(smmu, SMMU_SMR(i), 0x7fffu << 16);
++		mask = gpu_rd(smmu, SMMU_SMR(i));
++		gpu_wr(smmu, SMMU_SMR(i), before);
++		printf("SWEET GPU: SMR%u test: id bits 0x%08x mask bits 0x%08x, restored 0x%08x\n",
++		    i, id, mask, gpu_rd(smmu, SMMU_SMR(i)));
++	}
++}
++
++enum { SMMU_FAILED, SMMU_UNROUTED, SMMU_ROUTED };
++
+ /* Context bank GMU_CB translating stream IDs 4 and 5 through the gmem tables. */
+-static bool
++static int
+ gpu_smmu_setup(void)
+ {
+ 	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+ 
+ 	if (smmu == 0) {
+-		return false;
++		return SMMU_FAILED;
+ 	}
+ 	if (gpu_rd(smmu, SMMU_CB(GMU_CB) + SMMU_CB_SCTLR) != 0 ||
+ 	    (gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX)) & SMR_VALID)) {
+ 		printf("SWEET GPU: SMMU CB%u / SMR%u already in use; not touched\n", GMU_CB, GMU_SMR_IDX);
+-		return false;
++		return SMMU_FAILED;
+ 	}
+ 	/* qsmmuv2_device_reset: impl-defs while the micro-MMU is halted. */
+ 	gpu_wr(smmu, SMMU_MICRO_MMU_CTRL, gpu_rd(smmu, SMMU_MICRO_MMU_CTRL) | MICRO_MMU_HALT_REQ);
+ 	if (!gpu_poll(smmu, SMMU_MICRO_MMU_CTRL, MICRO_MMU_IDLE, MICRO_MMU_IDLE, 30000)) {
+ 		printf("SWEET GPU: SMMU did not halt (0x%08x)\n", gpu_rd(smmu, SMMU_MICRO_MMU_CTRL));
+-		return false;
++		return SMMU_FAILED;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(smmu_impl_defs) / sizeof(smmu_impl_defs[0]); i++) {
+ 		gpu_wr(smmu, smmu_impl_defs[i][0], smmu_impl_defs[i][1]);
+ 	}
+ 	gpu_wr(smmu, SMMU_MICRO_MMU_CTRL, gpu_rd(smmu, SMMU_MICRO_MMU_CTRL) & ~MICRO_MMU_HALT_REQ);
++	printf("SWEET GPU: SMMU resumed: MICRO_MMU_CTRL 0x%08x sCR0 0x%08x\n",
++	    gpu_rd(smmu, SMMU_MICRO_MMU_CTRL), gpu_rd(smmu, SMMU_sCR0));
++	gpu_smmu_smr_test(smmu);
+ 
+ 	/* arm_smmu_write_context_bank: TTBCR2/TTBCR before the TTBR. */
+ 	vm_offset_t cb = smmu + SMMU_CB(GMU_CB);
+@@ -755,7 +793,7 @@
+ 	gpu_wr(cb, SMMU_CB_FSR, gpu_rd(cb, SMMU_CB_FSR));      /* write 1 to clear */
+ 	gpu_wr(cb, SMMU_CB_TLBIALL, 0);
+ 	if (!smmu_sync(cb, SMMU_CB_TLBSYNC, SMMU_CB_TLBSTATUS)) {
+-		return false;
++		return SMMU_FAILED;
+ 	}
+ 	gpu_wr(cb, SMMU_CB_SCTLR, SCTLR_GMU);
+ 
+@@ -764,13 +802,19 @@
+ 	gpu_wr(smmu, SMMU_SMR(GMU_SMR_IDX), SMR_VALID | (1u << 16) | GMU_SID);
+ 	gpu_wr(smmu, SMMU_TLBIALLNSNH, 0);
+ 	if (!smmu_sync(smmu, SMMU_sTLBGSYNC, SMMU_sTLBGSTATUS)) {
+-		return false;
++		return SMMU_FAILED;
+ 	}
+ 	printf("SWEET GPU: SMMU CB%u: SCTLR 0x%08x TCR 0x%08x TCR2 0x%08x TTBR0 0x%08x%08x MAIR0 0x%08x; SMR%u 0x%08x S2CR 0x%08x\n",
+ 	    GMU_CB, gpu_rd(cb, SMMU_CB_SCTLR), gpu_rd(cb, SMMU_CB_TCR), gpu_rd(cb, SMMU_CB_TTBCR2),
+ 	    gpu_rd(cb, SMMU_CB_TTBR0 + 4), gpu_rd(cb, SMMU_CB_TTBR0), gpu_rd(cb, SMMU_CB_MAIR0), GMU_SMR_IDX,
+ 	    gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX)), gpu_rd(smmu, SMMU_S2CR(GMU_SMR_IDX)));
+-	return true;
++	uint32_t smr = gpu_rd(smmu, SMMU_SMR(GMU_SMR_IDX));
++	if (smr != (SMR_VALID | (1u << 16) | GMU_SID)) {
++		printf("SWEET GPU: SMR%u reads 0x%08x, not the 0x%08x written: GMU streams are not routed\n",
++		    GMU_SMR_IDX, smr, SMR_VALID | (1u << 16) | GMU_SID);
++		return SMMU_UNROUTED;
++	}
++	return SMMU_ROUTED;
+ }
+ 
+ static void
+@@ -896,6 +940,8 @@
+ hfi_cmd(const char *name, uint32_t *msg, unsigned n, uint32_t *ack, unsigned ack_max)
+ {
+ 	msg[0] = (msg[0] & 0xfffff) | (++hfi_seq << 20);
++	printf("SWEET GPU: HFI %s: sending 0x%08x (%u dwords)\n", name, msg[0], n);
++	sweet_log_sync();
+ 	if (!hfi_write(HFI_CMD_ID, msg, n)) {
+ 		return false;
+ 	}
+@@ -946,6 +992,8 @@
+ {
+ 	uint32_t ack[19];
+ 
++	printf("SWEET GPU: starting HFI (HFI_CTRL_INIT)\n");
++	sweet_log_sync();
+ 	gpu_wr(gmu, GMU_HFI_CTRL_INIT, 1);
+ 	if (!gpu_poll(gmu, GMU_HFI_CTRL_STATUS_REG, 1, 1, GMU_START_TIMEOUT_US)) {
+ 		printf("SWEET GPU: HFI init failed: HFI_CTRL_STATUS 0x%08x\n", gpu_rd(gmu, GMU_HFI_CTRL_STATUS_REG));
+@@ -1036,6 +1084,7 @@
+ 	gpu_wr(gmu, GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
+ 	gpu_wr(gmu, GMU_RPMH_CTRL, gpu_rd(gmu, GMU_RPMH_CTRL) | GMU_RPMH_ENABLE_MASK);
+ 	gpu_gmu_state("before start");
++	sweet_log_sync();
+ 
+ 	/* a6xx_gmu_start */
+ 	gpu_wr(gmu, GMU_CX_GMU_WFI_CONFIG, 0);
+@@ -1047,6 +1096,7 @@
+ 	printf("SWEET GPU: GMU %s after %llu us\n", booted ? "BOOTED (0xBABEFACE)" : "did not boot", ns / 1000);
+ 	gpu_gmu_state("after start");
+ 	gpu_smmu_faults();
++	sweet_log_sync();
+ 
+ 	if (hold) {
+ 		gpu_gmu_reset();
+@@ -1091,13 +1141,19 @@
+ 		gpu_gmu_boot(true);
+ 	}
+ 	/* KGSL order: GMU memory and IOMMU at probe, HFI table, then the boot. */
+-	if (mode >= 4 && gmu != 0 && gpu_gmem_alloc() && gpu_smmu_setup()) {
++	if (mode >= 4 && gmu != 0 && gpu_gmem_alloc()) {
++		int smmu = gpu_smmu_setup();
++		if (smmu == SMMU_FAILED || (smmu == SMMU_UNROUTED && mode < 5)) {
++			printf("SWEET GPU: GMU not booted (sweetgpu=5 boots it without a routed SMR)\n");
++			return;
++		}
+ 		gpu_hfi_table();
+ 		bool booted = gpu_gmu_boot(false);
+ 		if (booted) {
+ 			gpu_hfi_start();
+ 		}
+ 		gpu_gmu_reset();
++		sweet_log_sync();
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
