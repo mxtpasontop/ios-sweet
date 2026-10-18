@@ -1,0 +1,139 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -14,7 +14,9 @@
+  *               status registers say its power domain and clocks are on
+  *               (an access to a gated block would hang)
+  *   sweetgpu=2  probe, then power the CX domain and the GMU clocks as
+- *               downstream gdsc_enable + a6xx GMU resume do, and probe again
++ *               downstream gdsc_enable + a6xx GMU resume do, and probe again;
++ *               then dump the GPU SMMU (read-only) and test GMU ITCM/DTCM
++ *               writes while the GMU Cortex-M3 is held in reset
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -100,6 +102,37 @@
+ 	{ "AO_SPARE_CNTL", 0x23b16 },
+ };
+ 
++/*
++ * a615-family legacy GMU firmware load (_load_legacy_gmu_fw): the raw
++ * image, at most MAX_GMUFW_SIZE 0x8000, goes to CM3_ITCM_START and runs on
++ * into the DTCM, which follows the 16 KiB ITCM directly.
++ */
++#define GMU_CM3_SYSRESET        GMU_REG(0x1f800)
++#define GMU_ITCM                GMU_REG(0x1b400)
++#define GMU_DTCM                GMU_REG(0x1c400)
++#define GMU_TCM_SIZE            0x4000
++
++/*
++ * GPU SMMU (DT kgsl_smmu, qcom,smmu-v2, not skip-init: the kernel owns it).
++ * The GMU uses stream IDs 4 (gmu_user) and 5 (gmu_kernel). ARM SMMUv2
++ * layout: global space 0 at the base, global space 1 one page above it,
++ * then the context banks after 2^(NUMPAGENDXB + 1) pages.
++ */
++#define SMMU_PA                 0x05040000
++#define SMMU_SIZE               0x00010000
++#define SMMU_sCR0               0x000
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_IDR2               0x028
++#define SMMU_SMR(n)             (0x800 + 4u * (n))
++#define SMMU_S2CR(n)            (0xc00 + 4u * (n))
++#define SMMU_CBAR(n)            (4u * (n))      /* in global space 1 */
++#define SMMU_CB_SCTLR           0x00
++#define SMMU_CB_TTBR0_LO        0x20
++#define SMMU_CB_TTBR0_HI        0x24
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_FSR             0x58
++
+ #define A6XX_RBBM_STATUS        0x210
+ #define A6XX_CP_SQE_INSTR_BASE_LO 0x830
+ 
+@@ -252,6 +285,77 @@
+ 	return ok;
+ }
+ 
++/* Needs the CX GDSC and GCC_GPU_MEMNOC_GFX_CLK (DT kgsl_smmu clocks). */
++static void
++gpu_smmu_probe(void)
++{
++	if (gpu_rd(gcc, GCC_GPU_MEMNOC_GFX_CBCR) & CBCR_CLK_OFF) {
++		printf("SWEET GPU: SMMU clock off; SMMU not read\n");
++		return;
++	}
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (smmu == 0) {
++		printf("SWEET GPU: SMMU map failed\n");
++		return;
++	}
++	uint32_t id0 = gpu_rd(smmu, SMMU_IDR0), id1 = gpu_rd(smmu, SMMU_IDR1);
++	unsigned nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	uint32_t page = (id1 & (1u << 31)) ? 0x10000 : 0x1000;
++	uint32_t cb_base = page << (((id1 >> 28) & 7) + 1);
++	printf("SWEET GPU: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x IDR2 0x%08x: %u SMRs, %u CBs, page 0x%x, CBs at +0x%x\n",
++	    gpu_rd(smmu, SMMU_sCR0), id0, id1, gpu_rd(smmu, SMMU_IDR2), nsmr, ncb, page, cb_base);
++	for (unsigned i = 0; i < nsmr && SMMU_S2CR(i) < page; i++) {
++		uint32_t smr = gpu_rd(smmu, SMMU_SMR(i)), s2cr = gpu_rd(smmu, SMMU_S2CR(i));
++		if (smr || s2cr) {
++			printf("SWEET GPU: SMMU SMR%-2u 0x%08x (%s id 0x%x mask 0x%x) S2CR 0x%08x (type %u cb %u)\n",
++			    i, smr, (smr & (1u << 31)) ? "valid" : "invalid", smr & 0x7fff, (smr >> 16) & 0x7fff,
++			    s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++		}
++	}
++	for (unsigned i = 0; i < ncb; i++) {
++		uint32_t cb = cb_base + i * page;
++		if (cb + page > SMMU_SIZE || page + SMMU_CBAR(i) >= cb_base) {
++			printf("SWEET GPU: SMMU CB%u outside the 0x%x mapping\n", i, SMMU_SIZE);
++			break;
++		}
++		printf("SWEET GPU: SMMU CB%-2u CBAR 0x%08x SCTLR 0x%08x TCR 0x%08x TTBR0 0x%08x%08x FSR 0x%08x\n",
++		    i, gpu_rd(smmu, page + SMMU_CBAR(i)), gpu_rd(smmu, cb + SMMU_CB_SCTLR),
++		    gpu_rd(smmu, cb + SMMU_CB_TCR), gpu_rd(smmu, cb + SMMU_CB_TTBR0_HI),
++		    gpu_rd(smmu, cb + SMMU_CB_TTBR0_LO), gpu_rd(smmu, cb + SMMU_CB_FSR));
++	}
++}
++
++/* Write and read back the first and last words of ITCM and DTCM, then clear them. */
++static void
++gpu_tcm_test(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t    base;
++	} tcm[] = { { "ITCM", GMU_ITCM }, { "DTCM", GMU_DTCM } };
++	uint32_t sysreset = gpu_rd(gmu, GMU_CM3_SYSRESET);
++
++	if (sysreset != 1) {
++		printf("SWEET GPU: CM3_SYSRESET 0x%08x, GMU core not held in reset; TCM not written\n", sysreset);
++		return;
++	}
++	for (unsigned t = 0; t < sizeof(tcm) / sizeof(tcm[0]); t++) {
++		uint32_t offs[] = { 0, 4, 8, 12, GMU_TCM_SIZE - 4 }, bad = 0;
++		for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
++			gpu_wr(gmu, tcm[t].base + offs[i], 0x5ee70000u | (t << 12) | offs[i]);
++		}
++		for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
++			uint32_t want = 0x5ee70000u | (t << 12) | offs[i], got = gpu_rd(gmu, tcm[t].base + offs[i]);
++			if (got != want) {
++				printf("SWEET GPU: %s +0x%04x wrote 0x%08x read 0x%08x\n", tcm[t].name, offs[i], want, got);
++				bad++;
++			}
++			gpu_wr(gmu, tcm[t].base + offs[i], 0);
++		}
++		printf("SWEET GPU: %s write/readback %s\n", tcm[t].name, bad ? "FAILED" : "ok");
++	}
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -281,5 +385,9 @@
+ 		return;
+ 	}
+ 	gpu_report_gmu(gx_gdscr);
++	if (mode >= 2 && gmu != 0) {
++		gpu_smmu_probe();
++		gpu_tcm_test();
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
