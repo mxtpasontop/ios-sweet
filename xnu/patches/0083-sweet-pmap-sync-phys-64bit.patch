@@ -1,0 +1,17 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,13 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * SWEET: ptoa widens before the shift; (pp << PAGE_SHIFT) is a 32-bit
++	 * shift and drops bit 32+ of the address. Apple's coherent-IO SoCs
++	 * make flush_dcache a no-op, but on sweet all kernel RAM is above
++	 * 4 GiB (pmap_set_cache_attributes panicked in phystokv_range).
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
