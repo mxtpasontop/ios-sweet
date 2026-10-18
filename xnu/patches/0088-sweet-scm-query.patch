@@ -1,0 +1,185 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_scm.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_scm_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -661,6 +662,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_scm_probe();
+ 	sweet_gpu_probe();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_scm.c
+@@ -0,0 +1,154 @@
++/*
++ * SWEET: Qualcomm SCM availability queries, opt-in with sweetscm=1.
++ *
++ * Protocol reference: this phone's LineageOS drivers/soc/qcom/scm.c
++ * (is_scm_armv8, scm_is_call_available, __scm_call_armv8_64) and Linux
++ * drivers/firmware/qcom/qcom_scm-smc.c (QCOM_A6 continuation quirk).
++ * Only INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED are invoked here.
++ * No firmware loading, memory ownership changes, or GPU register writes.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern void sweet_log_sync(void);
++void sweet_scm_probe(void);
++
++#define SCM_SIP                  0x02000000u
++#define SCM_64                   0x40000000u
++#define SCM_FAST                 0x80000000u
++#define SCM_INFO_AVAIL           (SCM_SIP | 0x0601u)
++#define SCM_PAS_SUPPORTED        (SCM_SIP | 0x0207u)
++#define SCM_PAS_GPU              13u
++#define SCM_INTERRUPTED          1
++#define SCM_BUSY                 (-12)
++#define SCM_RESUME_LIMIT         64u
++#define SCM_BUSY_LIMIT           3u
++
++struct scm_regs {
++	uint64_t a[7];
++};
++
++/* Preserve x6 returned by Qualcomm's firmware across interrupted calls. */
++#if defined(SWEET_SCM_TEST)
++static void scm_smccc(struct scm_regs *r);
++#else
++static void
++scm_smccc(struct scm_regs *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++	    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	*r = (struct scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++#endif
++
++/* All commands in this file have exactly one by-value argument. */
++static bool
++scm_query(uint32_t fn, uint32_t arg, bool fast, struct scm_regs *out)
++{
++	const struct scm_regs initial = { { fn, 1, arg, 0, 0, 0, 0 } };
++	for (unsigned busy = 0; busy <= SCM_BUSY_LIMIT; busy++) {
++		*out = initial;
++		for (unsigned resume = 0; ; resume++) {
++			scm_smccc(out);
++			if ((int32_t)out->a[0] != SCM_INTERRUPTED) {
++				break;
++			}
++			if (resume == SCM_RESUME_LIMIT) {
++				printf("SWEET SCM: interrupted query did not complete; no further queries\n");
++				return false;
++			}
++			/* Firmware returned x0=1 and a continuation token in x6. */
++		}
++		if ((int32_t)out->a[0] != SCM_BUSY) {
++			return true;
++		}
++		if (fast || busy == SCM_BUSY_LIMIT) {
++			printf("SWEET SCM: query busy; no further queries\n");
++			return false;
++		}
++		delay(30000);
++	}
++	return false;
++}
++
++static bool
++scm_logged_query(const char *name, uint32_t fn, uint32_t arg, bool fast, struct scm_regs *r)
++{
++	printf("SWEET SCM: %s fn=%#x arg=%#x\n", name, fn, arg);
++	sweet_log_sync();
++	bool done = scm_query(fn, arg, fast, r);
++	printf("SWEET SCM: %s completed=%u status=%d result=%#llx/%#llx/%#llx\n",
++	    name, done, (int32_t)r->a[0], r->a[1], r->a[2], r->a[3]);
++	sweet_log_sync();
++	return done;
++}
++
++void
++sweet_scm_probe(void)
++{
++	int enabled = 0;
++	struct scm_regs r;
++	PE_parse_boot_argn("sweetscm", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++
++	/* Same convention detection as the phone's is_scm_armv8(). */
++	uint32_t mask = SCM_64;
++	if (!scm_logged_query("SMC64 convention", SCM_FAST | mask | SCM_INFO_AVAIL,
++	    SCM_FAST | SCM_INFO_AVAIL, true, &r)) {
++		return;
++	}
++	if ((int32_t)r.a[0] != 0 || r.a[1] == 0) {
++		/* Only an unsupported convention is a reason to try SMC32. */
++		if ((int32_t)r.a[0] != -1 && (int32_t)r.a[0] != 0) {
++			return;
++		}
++		mask = 0;
++		if (!scm_logged_query("SMC32 convention", SCM_FAST | SCM_INFO_AVAIL,
++		    SCM_FAST | SCM_INFO_AVAIL, true, &r) || (int32_t)r.a[0] != 0 || r.a[1] == 0) {
++			printf("SWEET SCM: no ARMv8 SCM convention; legacy ABI not attempted\n");
++			return;
++		}
++	}
++	printf("SWEET SCM: selected SMC%u\n", mask ? 64 : 32);
++
++	static const struct {
++		const char *name;
++		uint32_t cmd;
++	} queries[] = {
++		{ "PAS_INIT_IMAGE available", 1 },
++		{ "PAS_MEM_SETUP available", 2 },
++		{ "PAS_AUTH_AND_RESET available", 5 },
++		{ "PAS_SHUTDOWN available", 6 },
++		{ "PAS_IS_SUPPORTED available", 7 },
++	};
++	for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
++		uint32_t target = SCM_SIP | 0x0200u | queries[i].cmd;
++		if (!scm_logged_query(queries[i].name, mask | SCM_INFO_AVAIL, target, false, &r) ||
++		    (int32_t)r.a[0] != 0) {
++			return;
++		}
++	}
++	/* The last availability result describes the query itself, not PAS id 13. */
++	if (r.a[1] != 0) {
++		if (!scm_logged_query("PAS GPU id 13 supported", mask | SCM_PAS_SUPPORTED,
++		    SCM_PAS_GPU, false, &r) || (int32_t)r.a[0] != 0) {
++			return;
++		}
++	}
++	printf("SWEET SCM: availability probe complete\n");
++	sweet_log_sync();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
