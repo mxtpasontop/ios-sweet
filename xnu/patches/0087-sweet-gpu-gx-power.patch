@@ -1,0 +1,288 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -37,6 +37,10 @@
+  *               a bandwidth table without RPMh commands, H2F_MSG_TEST.
+  *   sweetgpu=5  4, but goes on without a valid SMR, to reproduce that reset;
+  *               the console log is flushed (sweet_log_sync) before each step.
++ *   sweetgpu=6  4 with GX: the boot OOB turns on the GX rail at 180 MHz
++ *               (a6xx_gmu_gfx_rail_on) and SPTPRAC before HFI; after HFI
++ *               the oob_gpu request, the GX domain and GPU core registers
++ *               are read, then the GPU is sent to slumber.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -353,6 +357,34 @@
+ #define HFI_RSP_TIMEOUT_US      100000
+ #define GMU_COLD_BOOT           1
+ #define GMU_FW_VERSION_1_8      0x10080000u     /* GMU_VERSION(gpmu_major 1, gpmu_minor 8) */
++/*
++ * GX power through the GMU (HFI_USE_REG quirk): the boot/slumber option and
++ * vote indices live in the GMU's DTCM; OOB requests use the a630/a615-family
++ * bits (set BIT(req + 16), ack and clear BIT(req + 24)).
++ */
++#define GMU_BOOT_SLUMBER_OPTION GMU_REG(0x1cbf8)
++#define GMU_GX_VOTE_IDX         GMU_REG(0x1cbf9)
++#define GMU_MX_VOTE_IDX         GMU_REG(0x1cbfa)
++#define GMU_GX_SPTPRAC_POWER_CONTROL GMU_REG(0x1a881)
++#define GMU_SPTPRAC_PWR_CLK_STATUS GMU_REG(0x1f8d0)
++#define GMU_RPMH_POWER_STATE    GMU_REG(0x1f8ec)
++#define OOB_BOOT_OPTION         0
++#define OOB_SLUMBER_OPTION      1
++#define OOB_GPU                 0
++#define OOB_BOOT_SLUMBER        6
++#define SPTPRAC_POWERON_CTRL    0x00778000u
++#define SPTPRAC_POWEROFF_CTRL   0x00778001u
++#define SPTPRAC_POWERON_STATUS  (1u << 3)
++#define SPTPRAC_POWEROFF_STATUS (1u << 2)
++#define SPTPRAC_TIMEOUT_US      10000
++#define GX_GDSC_RETAIN_FF       (1u << 11)
++#define GPU_HW_SLUMBER          0xf
++/*
++ * KGSL perf_idx = num_pwrlevels - default_pwrlevel - 1; every DT bin has
++ * initial-pwrlevel = its lowest non-zero level, so 1: 180 MHz.
++ */
++#define GX_BOOT_LEVEL           1
++
+ #define H2F_MSG_BW_VOTE_TBL     3
+ #define H2F_MSG_PERF_TBL        4
+ #define H2F_MSG_TEST            5
+@@ -395,6 +427,7 @@
+ };
+ 
+ static uint32_t gx_votes[MAX_GX_LEVELS], cx_votes[MAX_CX_LEVELS];
++static uint32_t gx_khz[MAX_GX_LEVELS], cx_khz[MAX_CX_LEVELS];
+ static unsigned gx_levels;
+ 
+ #define A6XX_RBBM_STATUS        0x210
+@@ -1115,7 +1148,7 @@
+ 
+ /* The ARC tables from cmd-db and the GX/CX DCVS votes for the fused speed bin. */
+ static bool
+-gpu_dcvs_votes(uint32_t *gx_khz, uint32_t *cx_khz)
++gpu_dcvs_votes(void)
+ {
+ 	static const char *const arcs[] = { "gfx.lvl", "mx.lvl", "cx.lvl" };
+ 	uint16_t lvl[3][MAX_GX_LEVELS];
+@@ -1134,9 +1167,9 @@
+ 		printf("SWEET GPU: speed bin 0x%x (fuse 0x%08x) not in the DT; no DCVS table\n", bin, fuse);
+ 		return false;
+ 	}
+-	gx_levels = gpu_bins[b].n;
++	unsigned nlev = gpu_bins[b].n;
+ 	printf("SWEET GPU: speed bin 0x%x (fuse 0x%08x): %u GPU levels, top %u MHz\n",
+-	    bin, fuse, gx_levels, gpu_bins[b].mhz[gx_levels - 1]);
++	    bin, fuse, nlev, gpu_bins[b].mhz[nlev - 1]);
+ 	for (unsigned a = 0; a < 3; a++) {
+ 		int error = sweet_rpmh_arc_levels(arcs[a], lvl[a], MAX_GX_LEVELS, &num[a], &addr[a]);
+ 		if (error) {
+@@ -1150,23 +1183,24 @@
+ 		    lvl[a][0], lvl[a][1], lvl[a][2], lvl[a][3], lvl[a][4], lvl[a][5],
+ 		    lvl[a][6], lvl[a][7], lvl[a][8], lvl[a][9], lvl[a][10], lvl[a][11]);
+ 	}
+-	for (unsigned i = 0; i < gx_levels; i++) {
++	for (unsigned i = 0; i < nlev; i++) {
+ 		gx_vl[i] = gx_vlvl(gpu_bins[b].mhz[i]);
+ 		gx_khz[i] = gpu_bins[b].mhz[i] * 1000u;
+ 	}
+ 	cx_khz[0] = 0;
+ 	cx_khz[1] = 200000;
+-	if (!arc_vote_tbl("GX", lvl[0], num[0], lvl[1], num[1], gx_vl, gx_levels, gx_votes) ||
++	if (!arc_vote_tbl("GX", lvl[0], num[0], lvl[1], num[1], gx_vl, nlev, gx_votes) ||
+ 	    !arc_vote_tbl("CX", lvl[2], num[2], lvl[1], num[1], cx_vl, 2, cx_votes)) {
+ 		return false;
+ 	}
+-	for (unsigned i = 0; i < gx_levels; i++) {
++	for (unsigned i = 0; i < nlev; i++) {
+ 		printf("SWEET GPU: GX level %u: %u MHz VLVL %u -> vote 0x%08x (gfx %u, mx %u)\n", i,
+ 		    gpu_bins[b].mhz[i], gx_vl[i], gx_votes[i], gx_votes[i] & 0xff, (gx_votes[i] >> 8) & 0xff);
+ 	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		printf("SWEET GPU: CX level %u: %u MHz VLVL %u -> vote 0x%08x\n", i, cx_khz[i] / 1000, cx_vl[i], cx_votes[i]);
+ 	}
++	gx_levels = nlev;                       /* only once every vote is valid */
+ 	return true;
+ }
+ 
+@@ -1180,10 +1214,9 @@
+ static bool
+ gpu_hfi_tables(uint32_t *ack)
+ {
+-	uint32_t gx_khz[MAX_GX_LEVELS] = { 0 }, cx_khz[MAX_CX_LEVELS] = { 0 };
+ 	uint32_t m[BW_TBL_DW > PERF_TBL_DW ? BW_TBL_DW : PERF_TBL_DW];
+ 
+-	if (!gpu_dcvs_votes(gx_khz, cx_khz)) {
++	if (gx_levels == 0 && !gpu_dcvs_votes()) {
+ 		return false;
+ 	}
+ 	bzero(m, sizeof(m));
+@@ -1211,11 +1244,12 @@
+ 	return hfi_cmd("H2F_MSG_TEST", test, 2, ack, 19);
+ }
+ 
+-/* a6xx_gmu_hfi_start, then hfi_start up to the firmware version check. */
+-static void
++/* a6xx_gmu_hfi_start, then the v1 hfi_start; true when every message was acknowledged. */
++static bool
+ gpu_hfi_start(void)
+ {
+ 	uint32_t ack[19];
++	bool done = false;
+ 
+ 	printf("SWEET GPU: starting HFI (HFI_CTRL_INIT)\n");
+ 	sweet_log_sync();
+@@ -1224,14 +1258,14 @@
+ 		printf("SWEET GPU: HFI init failed: HFI_CTRL_STATUS 0x%08x\n", gpu_rd(gmu, GMU_HFI_CTRL_STATUS_REG));
+ 		gpu_smmu_cb_faults();
+ 		gpu_hfi_dump();
+-		return;
++		return false;
+ 	}
+ 	uint32_t ver = gpu_rd(gmu, GMU_HFI_VERSION_INFO);
+ 	printf("SWEET GPU: HFI up: HFI_CTRL_STATUS 0x%08x, HFI version 0x%08x (major %u minor %u branch %u)\n",
+ 	    gpu_rd(gmu, GMU_HFI_CTRL_STATUS_REG), ver, ver >> 28, (ver >> 5) & 0x7fffff, ver & 0x1f);
+ 	if ((ver >> 28) >= 2) {
+ 		printf("SWEET GPU: HFI v2 firmware; this driver speaks the a615-family v1 protocol only\n");
+-		return;
++		return false;
+ 	}
+ 
+ 	uint32_t init[5] = {
+@@ -1242,13 +1276,105 @@
+ 		if (hfi_cmd("H2F_MSG_FW_VER", fwver, 2, ack, 19)) {
+ 			printf("SWEET GPU: GMU firmware version 0x%08x: %u.%u step %u (KGSL wants 1.8)\n",
+ 			    ack[3], ack[3] >> 28, (ack[3] >> 16) & 0xfff, ack[3] & 0xffff);
+-			if (gpu_hfi_tables(ack)) {
++			done = gpu_hfi_tables(ack);
++			if (done) {
+ 				printf("SWEET GPU: HFI start complete (DCVS, BW, TEST acknowledged)\n");
+ 			}
+ 		}
+ 	}
+ 	gpu_smmu_cb_faults();
+ 	gpu_hfi_dump();
++	return done;
++}
++
++/* a6xx_gmu_oob_set for the a615 family. */
++static bool
++gmu_oob_set(unsigned req, const char *name)
++{
++	uint32_t set = 1u << (req + 16), check = 1u << (req + 24);
++
++	printf("SWEET GPU: OOB %s: set 0x%08x\n", name, set);
++	sweet_log_sync();
++	gpu_wr(gmu, GMU_HOST2GMU_INTR_SET, set);
++	bool ok = gpu_poll(gmu, GMU_GMU2HOST_INTR_INFO, check, check, GMU_START_TIMEOUT_US);
++	uint32_t info = gpu_rd(gmu, GMU_GMU2HOST_INTR_INFO);
++	gpu_wr(gmu, GMU_GMU2HOST_INTR_CLR, check);
++	printf("SWEET GPU: OOB %s: %s (INTR_INFO 0x%08x, RPMH_POWER_STATE 0x%x, SPTPRAC 0x%08x)\n", name,
++	    ok ? "acknowledged" : "TIMED OUT", info, gpu_rd(gmu, GMU_RPMH_POWER_STATE),
++	    gpu_rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS));
++	return ok;
++}
++
++/* a6xx_gmu_oob_clear for the a615 family. */
++static void
++gmu_oob_clear(unsigned req)
++{
++	gpu_wr(gmu, GMU_HOST2GMU_INTR_SET, 1u << (req + 24));
++}
++
++/* a6xx_gmu_gfx_rail_on: GX/MX ARC indices of the boot level, then the boot OOB. */
++static bool
++gpu_gx_rail_on(void)
++{
++	uint32_t vote = gx_votes[GX_BOOT_LEVEL];
++
++	gpu_wr(gmu, GMU_BOOT_SLUMBER_OPTION, OOB_BOOT_OPTION);
++	gpu_wr(gmu, GMU_GX_VOTE_IDX, vote & 0xff);
++	gpu_wr(gmu, GMU_MX_VOTE_IDX, (vote >> 8) & 0xff);
++	printf("SWEET GPU: GX rail on at level %u (%u MHz): gfx ARC %u, mx ARC %u\n",
++	    GX_BOOT_LEVEL, gx_khz[GX_BOOT_LEVEL] / 1000, vote & 0xff, (vote >> 8) & 0xff);
++	return gmu_oob_set(OOB_BOOT_SLUMBER, "boot_slumber (boot)");
++}
++
++/* a6xx_gmu_sptprac_enable / _disable (the a615 family has the SPTPRAC GDSC). */
++static bool
++gpu_sptprac(bool on)
++{
++	if (!on) {
++		gpu_wr(cc, GPUCC_GX_GDSCR, gpu_rd(cc, GPUCC_GX_GDSCR) | GX_GDSC_RETAIN_FF);
++	}
++	gpu_wr(gmu, GMU_GX_SPTPRAC_POWER_CONTROL, on ? SPTPRAC_POWERON_CTRL : SPTPRAC_POWEROFF_CTRL);
++	uint32_t want = on ? SPTPRAC_POWERON_STATUS : SPTPRAC_POWEROFF_STATUS;
++	bool ok = gpu_poll(gmu, GMU_SPTPRAC_PWR_CLK_STATUS, want, want, SPTPRAC_TIMEOUT_US);
++	printf("SWEET GPU: SPTPRAC power %s: %s (status 0x%08x)\n", on ? "on" : "off",
++	    ok ? "ok" : "TIMED OUT", gpu_rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS));
++	return ok;
++}
++
++/* a6xx_gmu_notify_slumber with HFI_USE_REG; the bus level is 0 (one-level BW table). */
++static void
++gpu_gx_slumber(void)
++{
++	gpu_sptprac(false);
++	gpu_wr(gmu, GMU_BOOT_SLUMBER_OPTION, OOB_SLUMBER_OPTION);
++	gpu_wr(gmu, GMU_GX_VOTE_IDX, GX_BOOT_LEVEL);
++	gpu_wr(gmu, GMU_MX_VOTE_IDX, 0);
++	bool ok = gmu_oob_set(OOB_BOOT_SLUMBER, "boot_slumber (slumber)");
++	gmu_oob_clear(OOB_BOOT_SLUMBER);
++	uint32_t state = gpu_rd(gmu, GMU_RPMH_POWER_STATE);
++	printf("SWEET GPU: slumber %s: RPMH_POWER_STATE 0x%x%s\n", ok ? "acknowledged" : "not acknowledged",
++	    state, state == GPU_HW_SLUMBER ? " (slumber)" : " (NOT slumber)");
++}
++
++/*
++ * _adreno_start's OOB around the first GPU register access: oob_gpu turns
++ * GX on; read the GX domain and the GPU core, then clear oob_gpu and the
++ * boot OOB as a successful start does, and send the GPU to slumber.
++ */
++static void
++gpu_gx_test(void)
++{
++	uint32_t gx_gdscr;
++
++	if (gmu_oob_set(OOB_GPU, "gpu")) {
++		(void)gpu_report(&gx_gdscr);
++		gpu_report_gmu(gx_gdscr);
++		sweet_log_sync();
++	}
++	gmu_oob_clear(OOB_GPU);
++	gmu_oob_clear(OOB_BOOT_SLUMBER);
++	gpu_gx_slumber();
++	(void)gpu_report(&gx_gdscr);
+ }
+ 
+ /* Nothing services the GMU after the test: put it back into reset. */
+@@ -1371,14 +1497,28 @@
+ 	/* KGSL order: GMU memory and IOMMU at probe, HFI table, then the boot. */
+ 	if (mode >= 4 && gmu != 0 && gpu_gmem_alloc()) {
+ 		int smmu = gpu_smmu_setup();
+-		if (smmu == SMMU_FAILED || (smmu == SMMU_UNROUTED && mode < 5)) {
++		if (smmu == SMMU_FAILED || (smmu == SMMU_UNROUTED && mode != 5)) {
+ 			printf("SWEET GPU: GMU not booted (sweetgpu=5 boots it without a routed SMR)\n");
+ 			return;
+ 		}
++		/* sweetgpu=6: KGSL has the DCVS votes from probe; GX rail and SPTPRAC precede HFI. */
++		if (mode >= 6 && !gpu_dcvs_votes()) {
++			printf("SWEET GPU: no DCVS votes; GMU not booted\n");
++			return;
++		}
+ 		gpu_hfi_table();
+ 		bool booted = gpu_gmu_boot(false);
+-		if (booted) {
+-			gpu_hfi_start();
++		bool rail = false, gx = false;
++		if (booted && mode >= 6) {
++			rail = gpu_gx_rail_on();
++			gx = rail && gpu_sptprac(true);
++		}
++		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
++			gpu_gx_test();
++		} else if (rail) {
++			/* GX was voted on but the start did not complete: power it down again. */
++			gmu_oob_clear(OOB_BOOT_SLUMBER);
++			gpu_gx_slumber();
+ 		}
+ 		gpu_gmu_reset();
+ 		sweet_log_sync();
