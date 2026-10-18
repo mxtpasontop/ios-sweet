@@ -43,6 +43,11 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
+# bsd/dev/sweet_gpu.c loads the Adreno 618 GMU firmware from /sweet-gpu.
+# Qualcomm firmware (kept out of git): copy it from the phone's vendor
+# partition, /vendor/firmware/a618_gmu.bin, into this directory.
+GPU_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/gpu/fw')
+
 
 def d22ap_product(path=D22AP_ADT):
     """/product properties of the real D22AP tree, without the syscfg
@@ -211,6 +216,17 @@ def build(seed=None, qemu=False, highmem=False):
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
+    gmu_fw = os.path.join(GPU_FW_DIR, 'a618_gmu.bin')
+    if os.path.exists(gmu_fw):
+        gpu = [node('sweet-gpu', [
+            ph(),
+            ('compatible', cstr('qcom,adreno-618.0')),
+            ('gmu-firmware', open(gmu_fw, 'rb').read()),
+        ])]
+    else:
+        print(f'warning: {gmu_fw} missing, no /sweet-gpu node', file=sys.stderr)
+        gpu = []
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
@@ -223,7 +239,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs] + gpu))
 
 
 if __name__ == '__main__':

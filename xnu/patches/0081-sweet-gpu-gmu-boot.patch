@@ -1,0 +1,266 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -17,12 +17,19 @@
+  *               downstream gdsc_enable + a6xx GMU resume do, and probe again;
+  *               then dump the GPU SMMU (read-only) and test GMU ITCM/DTCM
+  *               writes while the GMU Cortex-M3 is held in reset
++ *   sweetgpu=3  2, then cold-boot the GMU firmware (ADT /sweet-gpu
++ *               gmu-firmware, tools/mkadt.py) as the phone's KGSL
++ *               a6xx_gmu_fw_start does, wait for 0xBABEFACE, report, and
++ *               hold the GMU in reset again. The SMMU is left as ABL left it
++ *               (every stream faults), so the GMU cannot reach RAM: the
++ *               global fault registers show what it tried to access.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_probe(void);
+@@ -132,6 +139,76 @@
+ #define SMMU_CB_TTBR0_HI        0x24
+ #define SMMU_CB_TCR             0x30
+ #define SMMU_CB_FSR             0x58
++#define SMMU_sGFAR_LO           0x040
++#define SMMU_sGFAR_HI           0x044
++#define SMMU_sGFSR              0x048
++#define SMMU_sGFSYNR0           0x050
++#define SMMU_sGFSYNR1           0x054
++#define SMMU_sGFSYNR2           0x058
++
++/*
++ * GMU cold boot (KGSL a6xx_gmu_fw_start, GMU_COLD_BOOT, TCM_BOOT): register
++ * numbers from the phone's a6xx_reg.h, values from adreno_a6xx_gmu.c.
++ */
++#define GMU_CM3_BOOT_CONFIG     GMU_REG(0x1f801)
++#define GMU_CX_GMU_WFI_CONFIG   GMU_REG(0x1f802)
++#define GMU_CM3_FW_INIT_RESULT  GMU_REG(0x1f81c)
++#define GMU_CM3_CFG_REG         GMU_REG(0x1f82d)
++#define GMU_SYS_BUS_CONFIG      GMU_REG(0x1f40f)
++#define GMU_ICACHE_CONFIG       GMU_REG(0x1f400)
++#define GMU_DCACHE_CONFIG       GMU_REG(0x1f401)
++#define GMU_PWR_COL_INTER_FRAME_CTRL GMU_REG(0x1f8c0)
++#define GMU_RPMH_CTRL           GMU_REG(0x1f8e8)
++#define GMU_PWR_COL_CP_MSG      GMU_REG(0x1f900)
++#define GMU_HFI_QTBL_INFO       GMU_REG(0x1f984)
++#define GMU_HFI_QTBL_ADDR       GMU_REG(0x1f985)
++#define GMU_HFI_SFR_ADDR        GMU_REG(0x1f982)
++#define GMU_GMU2HOST_INTR_INFO  GMU_REG(0x1f992)
++#define GMU_GENERAL_7_REG       GMU_REG(0x1f9cc)
++#define GMU_AO_HOST_INTERRUPT_STATUS GMU_REG(0x23b05)
++#define GMU_AHB_FENCE_RANGE_0   GMU_REG(0x23b11)
++#define GMU_TCM_BOOT            2
++#define GMU_FENCE_RANGE_MASK    ((1u << 31) | ((0xau << 2) << 18) | 0x8a0u)
++#define GMU_RPMH_ENABLE_MASK    0xf11u          /* interface, LLC, DDR, MX, CX, GFX votes */
++#define GMU_BOOT_DONE           0xbabeface
++#define GMU_START_TIMEOUT_US    100000          /* GMU_START_TIMEOUT 100 ms */
++/* a618 chipid 0x06010800 with minor/patch packed into bits 15:8 (HFI_SFR_ADDR). */
++#define GMU_CHIPID              0x06018000u
++/*
++ * GMU VAs KGSL's allocator gives the uncached kernel buffers (one 1 MiB slot
++ * each, in allocation order): dummy page, HFI, crash dump, log.
++ */
++#define GMU_VA_HFI              0x60100000u
++#define GMU_VA_LOG              0x60300000u
++
++#define GMU_RSCC_REG(r)         GMU_REG(r)
++#define RSCC_RSC_STATUS0_DRV0   0x23404
++#define RSCC_PDC_SEQ_START_ADDR 0x23408
++#define RSCC_PDC_MATCH_VALUE_LO 0x23409
++#define RSCC_PDC_MATCH_VALUE_HI 0x2340a
++#define RSCC_PDC_SLAVE_ID_DRV0  0x2340b
++#define RSCC_HIDDEN_TCS_CMD0_ADDR 0x2340d
++#define RSCC_HIDDEN_TCS_CMD0_DATA 0x2340e
++#define RSCC_OVERRIDE_START_ADDR 0x23500
++#define RSCC_SEQ_MEM_0_DRV0     0x23580
++#define RSC_CMD_OFFSET          2
++
++/* GPU PDC blocks (DT kgsl_gmu_pdc_cfg / kgsl_gmu_pdc_seq); dword offsets. */
++#define PDC_CFG_PA              0x0b290000
++#define PDC_SEQ_PA              0x0b490000
++#define PDC_SIZE                0x00010000
++#define PDC_GPU_ENABLE_PDC      0x1140
++#define PDC_GPU_SEQ_START_ADDR  0x1148
++#define PDC_GPU_TCS1_CONTROL    0x1572
++#define PDC_GPU_TCS1_CMD_ENABLE_BANK 0x1573
++#define PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK 0x1574
++#define PDC_GPU_TCS1_CMD0_MSGID 0x1575
++#define PDC_GPU_TCS3_CONTROL    0x15d6
++#define PDC_GPU_TCS3_CMD_ENABLE_BANK 0x15d7
++#define PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK 0x15d8
++#define PDC_GPU_TCS3_CMD0_MSGID 0x15d9
++#define PDC_CMD_OFFSET          4               /* MSGID, ADDR, DATA, (status) */
++#define PDC_ENABLE_REG_VALUE    0x80000001u
+ 
+ #define A6XX_RBBM_STATUS        0x210
+ #define A6XX_CP_SQE_INSTR_BASE_LO 0x830
+@@ -356,6 +433,157 @@
+ 	}
+ }
+ 
++/* PDC TCS command n of the bank starting at msgid0: MSGID, ADDR, DATA. */
++static void
++pdc_tcs_cmd(vm_offset_t cfg, uint32_t msgid0, unsigned n, uint32_t addr, uint32_t data)
++{
++	uint32_t r = msgid0 + n * PDC_CMD_OFFSET;
++	gpu_wr(cfg, 4u * r, 0x10108);
++	gpu_wr(cfg, 4u * (r + 1), addr);
++	gpu_wr(cfg, 4u * (r + 2), data);
++}
++
++/*
++ * _load_gmu_rpmh_ucode for the a618: RSC handshake and sequencer, PDC
++ * sequencer, and the TCS1/TCS3 RPMh commands the PDC sends on GPU power
++ * down and up (0x30010/0x30000/0x30090 are the RPMh addresses KGSL uses on
++ * this target; the a618 differs from the a630 in the third address and in
++ * TCS3's second data word).
++ */
++static bool
++gpu_gmu_rpmh_ucode(void)
++{
++	static const uint32_t rsc_seq[] = { 0xa7a506a0, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
++	static const uint32_t pdc_seq[] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
++	vm_offset_t cfg = ml_io_map(PDC_CFG_PA, PDC_SIZE), seq = ml_io_map(PDC_SEQ_PA, PDC_SIZE);
++
++	if (cfg == 0 || seq == 0) {
++		printf("SWEET GPU: PDC map failed\n");
++		return false;
++	}
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_RSC_STATUS0_DRV0), 1u << 24);    /* no SDE clock gating */
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_PDC_SLAVE_ID_DRV0), 1);
++	for (unsigned i = 0; i < 3; i++) {
++		gpu_wr(gmu, GMU_RSCC_REG(RSCC_HIDDEN_TCS_CMD0_DATA + i * RSC_CMD_OFFSET), i == 2 ? 0x80000000u : 0);
++		gpu_wr(gmu, GMU_RSCC_REG(RSCC_HIDDEN_TCS_CMD0_ADDR + i * RSC_CMD_OFFSET), 0);
++	}
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_OVERRIDE_START_ADDR), 0);
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_PDC_SEQ_START_ADDR), 0x4520);
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_PDC_MATCH_VALUE_LO), 0x4510);
++	gpu_wr(gmu, GMU_RSCC_REG(RSCC_PDC_MATCH_VALUE_HI), 0x4514);
++	for (unsigned i = 0; i < sizeof(rsc_seq) / sizeof(rsc_seq[0]); i++) {
++		gpu_wr(gmu, GMU_RSCC_REG(RSCC_SEQ_MEM_0_DRV0 + i), rsc_seq[i]);
++	}
++	for (unsigned i = 0; i < sizeof(pdc_seq) / sizeof(pdc_seq[0]); i++) {
++		gpu_wr(seq, 4u * i, pdc_seq[i]);                        /* PDC_GPU_SEQ_MEM_0 + i */
++	}
++	gpu_wr(cfg, 4u * PDC_GPU_TCS1_CMD_ENABLE_BANK, 7);
++	gpu_wr(cfg, 4u * PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK, 0);
++	gpu_wr(cfg, 4u * PDC_GPU_TCS1_CONTROL, 0);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS1_CMD0_MSGID, 0, 0x30010, 1);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS1_CMD0_MSGID, 1, 0x30000, 0);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS1_CMD0_MSGID, 2, 0x30090, 0);
++	gpu_wr(cfg, 4u * PDC_GPU_TCS3_CMD_ENABLE_BANK, 7);
++	gpu_wr(cfg, 4u * PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK, 0);
++	gpu_wr(cfg, 4u * PDC_GPU_TCS3_CONTROL, 0);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS3_CMD0_MSGID, 0, 0x30010, 2);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS3_CMD0_MSGID, 1, 0x30000, 2);
++	pdc_tcs_cmd(cfg, PDC_GPU_TCS3_CMD0_MSGID, 2, 0x30090, 3);
++	gpu_wr(cfg, 4u * PDC_GPU_SEQ_START_ADDR, 0);
++	gpu_wr(cfg, 4u * PDC_GPU_ENABLE_PDC, PDC_ENABLE_REG_VALUE);
++	return true;
++}
++
++static void
++gpu_smmu_faults(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (smmu == 0) {
++		return;
++	}
++	printf("SWEET GPU: SMMU sGFSR 0x%08x sGFSYNR0 0x%08x sGFSYNR1 0x%08x sGFSYNR2 0x%08x sGFAR 0x%08x%08x\n",
++	    gpu_rd(smmu, SMMU_sGFSR), gpu_rd(smmu, SMMU_sGFSYNR0), gpu_rd(smmu, SMMU_sGFSYNR1),
++	    gpu_rd(smmu, SMMU_sGFSYNR2), gpu_rd(smmu, SMMU_sGFAR_HI), gpu_rd(smmu, SMMU_sGFAR_LO));
++}
++
++static void
++gpu_gmu_state(const char *when)
++{
++	printf("SWEET GPU: GMU %s: FW_INIT_RESULT 0x%08x SYSRESET 0x%08x GMU2HOST_INFO 0x%08x AO_HOST_INT 0x%08x RPMH_POWER_STATE 0x%08x HFI_CTRL_STATUS 0x%08x\n",
++	    when, gpu_rd(gmu, GMU_CM3_FW_INIT_RESULT), gpu_rd(gmu, GMU_CM3_SYSRESET),
++	    gpu_rd(gmu, GMU_GMU2HOST_INTR_INFO), gpu_rd(gmu, GMU_AO_HOST_INTERRUPT_STATUS),
++	    gpu_rd(gmu, GMU_REG(0x1f8ec)), gpu_rd(gmu, GMU_REG(0x1f980)));
++}
++
++static void
++gpu_gmu_boot(void)
++{
++	DTEntry node;
++	uint32_t const *fw = NULL;
++	unsigned int size = 0, bad = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "gmu-firmware", (void const **)&fw, &size) != kSuccess) {
++		printf("SWEET GPU: no /sweet-gpu gmu-firmware in the device tree; GMU not booted\n");
++		return;
++	}
++	if (size == 0 || size > 2 * GMU_TCM_SIZE || (size & 3)) {
++		printf("SWEET GPU: gmu-firmware size %u invalid (max 0x%x)\n", size, 2 * GMU_TCM_SIZE);
++		return;
++	}
++	if (gpu_rd(gmu, GMU_CM3_SYSRESET) != 1) {
++		printf("SWEET GPU: GMU core not held in reset; not booted\n");
++		return;
++	}
++	gpu_smmu_faults();
++	gpu_wr(gmu, GMU_GENERAL_7_REG, 1);                     /* TCM retention */
++	if (!gpu_gmu_rpmh_ucode()) {
++		return;
++	}
++	/* _load_legacy_gmu_fw: raw image from ITCM_START, running on into DTCM. */
++	for (unsigned i = 0; i < size / 4; i++) {
++		gpu_wr(gmu, GMU_ITCM + 4 * i, fw[i]);
++	}
++	for (unsigned i = 0; i < size / 4; i++) {
++		bad += gpu_rd(gmu, GMU_ITCM + 4 * i) != fw[i];
++	}
++	printf("SWEET GPU: GMU firmware %u bytes loaded, %u words differ on readback\n", size, bad);
++	if (bad) {
++		return;
++	}
++	gpu_wr(gmu, GMU_CM3_FW_INIT_RESULT, 0);
++	gpu_wr(gmu, GMU_CM3_BOOT_CONFIG, GMU_TCM_BOOT);
++	gpu_wr(gmu, GMU_HFI_QTBL_ADDR, GMU_VA_HFI);
++	gpu_wr(gmu, GMU_HFI_QTBL_INFO, 1);
++	gpu_wr(gmu, GMU_AHB_FENCE_RANGE_0, GMU_FENCE_RANGE_MASK);
++	gpu_wr(gmu, GMU_CM3_CFG_REG, 0x4052);                  /* reset value, no NMI */
++	gpu_wr(gmu, GMU_HFI_SFR_ADDR, GMU_CHIPID);
++	gpu_wr(gmu, GMU_PWR_COL_CP_MSG, GMU_VA_LOG | 0);       /* log: one 4 KiB unit */
++	/* a6xx_gmu_power_config, idle level ACTIVE: caches off, RPMh client on. */
++	gpu_wr(gmu, GMU_SYS_BUS_CONFIG, 1);
++	gpu_wr(gmu, GMU_ICACHE_CONFIG, 1);
++	gpu_wr(gmu, GMU_DCACHE_CONFIG, 1);
++	gpu_wr(gmu, GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
++	gpu_wr(gmu, GMU_RPMH_CTRL, gpu_rd(gmu, GMU_RPMH_CTRL) | GMU_RPMH_ENABLE_MASK);
++	gpu_gmu_state("before start");
++
++	/* a6xx_gmu_start */
++	gpu_wr(gmu, GMU_CX_GMU_WFI_CONFIG, 0);
++	gpu_wr(gmu, GMU_CM3_SYSRESET, 0);
++	uint64_t t0 = mach_absolute_time();
++	bool booted = gpu_poll(gmu, GMU_CM3_FW_INIT_RESULT, 0xffffffffu, GMU_BOOT_DONE, GMU_START_TIMEOUT_US);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("SWEET GPU: GMU %s after %llu us\n", booted ? "BOOTED (0xBABEFACE)" : "did not boot", ns / 1000);
++	gpu_gmu_state("after start");
++	gpu_smmu_faults();
++
++	/* Nothing services the GMU yet: put it back into reset. */
++	gpu_wr(gmu, GMU_CM3_SYSRESET, 1);
++	delay(10);
++	gpu_gmu_state("reset again");
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -389,5 +617,8 @@
+ 		gpu_smmu_probe();
+ 		gpu_tcm_test();
+ 	}
++	if (mode >= 3 && gmu != 0) {
++		gpu_gmu_boot();
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
