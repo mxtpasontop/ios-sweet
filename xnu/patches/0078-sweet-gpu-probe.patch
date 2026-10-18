@@ -1,0 +1,181 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,150 @@
++/*
++ * SWEET: Adreno 618 GPU bring-up, step 1 - read-only state probe.
++ *
++ * The GPU (chipid 0x06010800, the A618 of sc7180) sits at 0x05000000 with
++ * its GMU (Cortex-M3 power manager) at 0x0506a000; its clocks and the CX
++ * and GX power domains come from the GPU clock controller at 0x05090000
++ * (offsets from Xiaomi's gpucc-sdmmagpie.c, GDSCs from the live DT). The
++ * GPU CC block itself is clocked by GCC_GPU_CFG_AHB_CLK. This probe only
++ * reports what state ABL leaves after `fastboot boot`. It never writes a
++ * register, and reads each block only when the status registers say its
++ * power domain and clocks are on (an access to a gated block would hang).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GCC_PA                  0x00100000
++#define GCC_SIZE                0x00090000
++#define GCC_GPU_CFG_AHB_CBCR    0x71004
++#define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
++#define GCC_GPU_SNOC_DVM_CBCR   0x71018
++#define GCC_GPU_GPLL0_VOTE      0x52004         /* gpll0 and gpll0_div branch enables */
++#define CBCR_CLK_OFF            (1u << 31)
++#define GDSC_PWR_ON             (1u << 31)
++
++#define GPUCC_PA                0x05090000
++#define GPUCC_SIZE              0x00009000
++#define GPUCC_GX_GDSCR          0x100c
++#define GPUCC_CX_GDSCR          0x106c
++
++static const struct {
++	const char *name;
++	uint32_t    off;
++} gpucc_cbcr[] = {
++	{ "ahb", 0x1078 },
++	{ "cx_gmu", 0x1098 },
++	{ "cxo", 0x109c },
++	{ "cx_snoc_dvm", 0x108c },
++	{ "cx_apb", 0x1088 },
++	{ "cxo_aon", 0x1004 },
++	{ "gx_gfx3d", 0x1054 },
++	{ "gx_gmu", 0x1064 },
++	{ "gx_cxo", 0x1060 },
++};
++enum { CC_AHB, CC_CX_GMU, CC_CXO, CC_CX_SNOC_DVM, CC_CX_APB, CC_CXO_AON, CC_GX_GFX3D };
++
++/* KGSL register numbers are dword offsets from the GPU base (a6xx_reg.h). */
++#define GPU_PA                  0x05000000
++#define GPU_SIZE                0x00040000
++#define GMU_PA                  0x0506a000
++#define GMU_SIZE                0x00031000
++#define GMU_REG(r)              ((r) * 4u - (GMU_PA - GPU_PA))
++
++static const struct {
++	const char *name;
++	uint32_t    reg;
++} gmu_regs[] = {
++	{ "CM3_SYSRESET", 0x1f800 },
++	{ "CM3_FW_INIT_RESULT", 0x1f81c },
++	{ "CM3_CFG", 0x1f82d },
++	{ "SPTPRAC_PWR_CLK_STATUS", 0x1f8d0 },
++	{ "CX_GMU_RPMH_POWER_STATE", 0x1f8ec },
++	{ "HFI_CTRL_STATUS", 0x1f980 },
++	{ "GENERAL_7", 0x1f9cc },
++	{ "RSCC_TCS0_DRV0_STATUS", 0x23746 },
++	{ "RSCC_CONTROL_ACK", 0x23b08 },
++	{ "AO_GPU_CX_BUSY_STATUS", 0x23b0c },
++	{ "AO_SPARE_CNTL", 0x23b16 },
++};
++
++#define A6XX_RBBM_STATUS        0x210
++#define A6XX_CP_SQE_INSTR_BASE_LO 0x830
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int enabled = 1;
++	uint32_t cfg_ahb, gx_gdscr, cx_gdscr, cbcr[sizeof(gpucc_cbcr) / sizeof(gpucc_cbcr[0])];
++
++	PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	cfg_ahb = gpu_rd(gcc, GCC_GPU_CFG_AHB_CBCR);
++	printf("SWEET GPU: GCC cfg_ahb 0x%08x memnoc_gfx 0x%08x snoc_dvm_gfx 0x%08x gpll0 vote 0x%08x\n",
++	    cfg_ahb, gpu_rd(gcc, GCC_GPU_MEMNOC_GFX_CBCR), gpu_rd(gcc, GCC_GPU_SNOC_DVM_CBCR),
++	    gpu_rd(gcc, GCC_GPU_GPLL0_VOTE));
++	if (cfg_ahb & CBCR_CLK_OFF) {
++		printf("SWEET GPU: GPU CC config clock off; GPU CC not read\n");
++		return;
++	}
++	vm_offset_t cc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (cc == 0) {
++		printf("SWEET GPU: GPU CC map failed\n");
++		return;
++	}
++	cx_gdscr = gpu_rd(cc, GPUCC_CX_GDSCR);
++	gx_gdscr = gpu_rd(cc, GPUCC_GX_GDSCR);
++	printf("SWEET GPU: GDSC cx 0x%08x (%s) gx 0x%08x (%s)\n",
++	    cx_gdscr, (cx_gdscr & GDSC_PWR_ON) ? "on" : "off",
++	    gx_gdscr, (gx_gdscr & GDSC_PWR_ON) ? "on" : "off");
++	for (unsigned i = 0; i < sizeof(gpucc_cbcr) / sizeof(gpucc_cbcr[0]); i++) {
++		cbcr[i] = gpu_rd(cc, gpucc_cbcr[i].off);
++		printf("SWEET GPU: clk %-12s CBCR 0x%08x (%s)\n", gpucc_cbcr[i].name, cbcr[i],
++		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++	}
++	/* GMU registers need the CX GDSC and the GMU, AHB and XO clocks. */
++	if (!(cx_gdscr & GDSC_PWR_ON) || (cbcr[CC_AHB] & CBCR_CLK_OFF) ||
++	    (cbcr[CC_CX_GMU] & CBCR_CLK_OFF) || (cbcr[CC_CXO] & CBCR_CLK_OFF)) {
++		printf("SWEET GPU: CX domain unpowered or unclocked; GMU not read\n");
++		return;
++	}
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (gmu == 0) {
++		printf("SWEET GPU: GMU map failed\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(gmu_regs) / sizeof(gmu_regs[0]); i++) {
++		printf("SWEET GPU: GMU %-24s 0x%08x\n", gmu_regs[i].name, gpu_rd(gmu, GMU_REG(gmu_regs[i].reg)));
++	}
++	/* The GPU core is in the GX domain, which the GMU normally controls. */
++	if (!(gx_gdscr & GDSC_PWR_ON) || (cbcr[CC_GX_GFX3D] & CBCR_CLK_OFF)) {
++		printf("SWEET GPU: GX domain off; GPU core not read\n");
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (gpu == 0) {
++		return;
++	}
++	printf("SWEET GPU: RBBM_STATUS 0x%08x CP_SQE_INSTR_BASE 0x%08x\n",
++	    gpu_rd(gpu, A6XX_RBBM_STATUS * 4), gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
