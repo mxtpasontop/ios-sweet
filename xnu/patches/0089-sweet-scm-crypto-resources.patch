@@ -1,0 +1,192 @@
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh.h
+@@ -0,0 +1,17 @@
++#ifndef _BSD_DEV_SWEET_RPMH_H_
++#define _BSD_DEV_SWEET_RPMH_H_
++#include <sys/types.h>
++
++/* Raw cmd-db BCM auxiliary data; validate before using it to compute votes. */
++struct sweet_rpmh_bcm {
++	uint32_t address;
++	uint32_t unit;
++	uint16_t width;
++	uint8_t vcd;
++	uint8_t reserved;
++	uint16_t version;
++};
++
++/* Read-only lookup: no RPMh votes or TCS register writes. */
++int sweet_rpmh_bcm_info(const char *res, struct sweet_rpmh_bcm *info);
++#endif
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,6 +9,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include "sweet_rpmh.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -434,4 +435,83 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/* Linux qcom_icc_bcm_init's cmd-db address + eight-byte bcm_db descriptor. */
++#define RH_BCM 5u
++static uint16_t
++rh_bcm_u16(uint32_t off)
++{
++	uint32_t lo = rh_read(rh_db, off & ~3u) >> (8u * (off & 3u));
++	uint32_t hi = rh_read(rh_db, (off + 1u) & ~3u) >> (8u * ((off + 1u) & 3u));
++	return (uint16_t)((lo & 0xffu) | ((hi & 0xffu) << 8));
++}
++
++int
++sweet_rpmh_bcm_info(const char *res, struct sweet_rpmh_bcm *info)
++{
++	uint32_t key[2] = { 0, 0 };
++	struct sweet_rpmh_bcm found = { 0 };
++	unsigned matches = 0, n = 0;
++	if (!res || !info) {
++		return EINVAL;
++	}
++	while (n < 8 && res[n]) {
++		key[n / 4] |= (uint32_t)(uint8_t)res[n] << (8u * (n % 4));
++		n++;
++	}
++	if (n == 0 || (n == 8 && res[n])) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	if (error) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			error = EINVAL;
++			goto out;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t address = rh_read(rh_db, e + 16);
++			uint32_t off = aux + rh_db16(e + 22);
++			unsigned len = rh_db16(e + 20);
++			if (slave != RH_BCM || (address >> 16) != RH_BCM || (address & 3u) ||
++			    len < 8 || !rh_range(off, len)) {
++				error = EINVAL;
++				goto out;
++			}
++			/* Aux entries need not be word-aligned. Read via aligned DB words. */
++			found.address = address;
++			found.unit = (uint32_t)rh_bcm_u16(off) | ((uint32_t)rh_bcm_u16(off + 2) << 16);
++			found.width = rh_bcm_u16(off + 4);
++			found.vcd = rh_bcm_u16(off + 6) & 0xff;
++			found.reserved = rh_bcm_u16(off + 6) >> 8;
++			found.version = rh_db16(h + 8);
++			matches++;
++		}
++	}
++	if (matches != 1) {
++		error = ENODEV;
++	} else {
++		*info = found;
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_scm.c
++++ b/bsd/dev/sweet_scm.c
+@@ -5,16 +5,19 @@
+  * (is_scm_armv8, scm_is_call_available, __scm_call_armv8_64) and Linux
+  * drivers/firmware/qcom/qcom_scm-smc.c (QCOM_A6 continuation quirk).
+  * Only INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED are invoked here.
+- * No firmware loading, memory ownership changes, or GPU register writes.
++ * sweetscm=2 also reports crypto-path BCM descriptors and GCC clock state.
++ * No firmware loading, memory ownership changes, RPMh votes, or register writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_rpmh.h"
+ 
+ extern void sweet_log_sync(void);
+ void sweet_scm_probe(void);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define SCM_SIP                  0x02000000u
+ #define SCM_64                   0x40000000u
+@@ -94,13 +97,44 @@
+ 	return done;
+ }
+ 
++/* Recovery live FDT: master 125 (crypto) -> slave 512 (DDR), deduplicated BCMs. */
++static void
++scm_crypto_resources(void)
++{
++	static const char *const names[] = { "CE0", "SN11", "SN0", "SH0", "MC0", "ACV" };
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
++		struct sweet_rpmh_bcm b;
++		int error = sweet_rpmh_bcm_info(names[i], &b);
++		if (error) {
++			printf("SWEET SCM: BCM %s lookup failed errno=%d\n", names[i], error);
++			continue;
++		}
++		printf("SWEET SCM: BCM %s addr=%#x unit=%u width=%u vcd=%u reserved=%u version=%#x\n",
++		    names[i], b.address, b.unit, b.width, b.vcd, b.reserved, b.version);
++	}
++	/* GCC is always accessible; do not read the potentially gated CE itself. */
++	vm_offset_t gcc = ml_io_map(0x00100000u, 0x90000u);
++	if (gcc) {
++		static const uint32_t offsets[] = { 0x41004u, 0x41008u, 0x4100cu, 0x52004u };
++		static const char *const clocks[] = { "core", "axi", "ahb", "shared_vote" };
++		for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
++			uint32_t v = *(volatile uint32_t *)(gcc + offsets[i]);
++			__asm__ volatile("dmb oshld" ::: "memory");
++			printf("SWEET SCM: CE1 %s GCC+%#x = %#x\n", clocks[i], offsets[i], v);
++		}
++	} else {
++		printf("SWEET SCM: GCC mapping failed\n");
++	}
++	sweet_log_sync();
++}
++
+ void
+ sweet_scm_probe(void)
+ {
+ 	int enabled = 0;
+ 	struct scm_regs r;
+ 	PE_parse_boot_argn("sweetscm", &enabled, sizeof(enabled));
+-	if (enabled != 1) {
++	if (enabled != 1 && enabled != 2) {
+ 		return;
+ 	}
+ 
+@@ -150,5 +184,8 @@
+ 	}
+ 	printf("SWEET SCM: availability probe complete\n");
+ 	sweet_log_sync();
++	if (enabled == 2) {
++		scm_crypto_resources();
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
