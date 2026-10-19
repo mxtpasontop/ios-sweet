@@ -1,0 +1,298 @@
+--- a/bsd/dev/sweet_scm.c
++++ b/bsd/dev/sweet_scm.c
+@@ -4,20 +4,28 @@
+  * Protocol reference: this phone's LineageOS drivers/soc/qcom/scm.c
+  * (is_scm_armv8, scm_is_call_available, __scm_call_armv8_64) and Linux
+  * drivers/firmware/qcom/qcom_scm-smc.c (QCOM_A6 continuation quirk).
+- * Only INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED are invoked here.
++ * sweetscm=1 performs INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED queries.
+  * sweetscm=2 also reports crypto-path BCM descriptors and GCC clock state.
+  * sweetscm=3 adds crypto bandwidth votes only (held until reset).
+- * No firmware loading, memory ownership changes, or direct clock writes.
++ * sweetscm=4 prepares signed zap loading; sweetgpu=7 invokes it with GX on.
++ * The test requests PAS shutdown before normal GPU slumber; buffers remain pinned.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ #include "sweet_rpmh.h"
+ 
+ extern void sweet_log_sync(void);
+ void sweet_scm_probe(void);
++bool sweet_scm_gpu_zap_test(void);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define SCM_SIP                  0x02000000u
+@@ -56,13 +64,11 @@
+ }
+ #endif
+ 
+-/* All commands in this file have exactly one by-value argument. */
+ static bool
+-scm_query(uint32_t fn, uint32_t arg, bool fast, struct scm_regs *out)
+-{
+-	const struct scm_regs initial = { { fn, 1, arg, 0, 0, 0, 0 } };
++scm_invoke(const struct scm_regs *initial, bool fast, struct scm_regs *out)
++{
+ 	for (unsigned busy = 0; busy <= SCM_BUSY_LIMIT; busy++) {
+-		*out = initial;
++		*out = *initial;
+ 		for (unsigned resume = 0; ; resume++) {
+ 			scm_smccc(out);
+ 			if ((int32_t)out->a[0] != SCM_INTERRUPTED) {
+@@ -87,6 +93,13 @@
+ }
+ 
+ static bool
++scm_query(uint32_t fn, uint32_t arg, bool fast, struct scm_regs *out)
++{
++	const struct scm_regs initial = { { fn, 1, arg, 0, 0, 0, 0 } };
++	return scm_invoke(&initial, fast, out);
++}
++
++static bool
+ scm_logged_query(const char *name, uint32_t fn, uint32_t arg, bool fast, struct scm_regs *r)
+ {
+ 	printf("SWEET SCM: %s fn=%#x arg=%#x\n", name, fn, arg);
+@@ -129,13 +142,146 @@
+ 	sweet_log_sync();
+ }
+ 
++static bool scm_zap_ready, scm_zap_attempted;
++#define ZAP_ALLOC_SIZE 0x100000u
++#define ZAP_LOGICAL_SIZE 0x1000u
++
++/* ELF32 little endian, byte accesses also accept an unaligned ADT property. */
++static uint32_t
++zap_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static uint16_t
++zap_u16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++/* Narrow a615_zap format: header + hash metadata, one relocatable code blob. */
++static bool
++zap_valid(const uint8_t *mdt, unsigned size, const uint8_t *code, unsigned code_size)
++{
++	if (!mdt || !code || size <= 148 || size > 8192 || !code_size || code_size > 4096 ||
++	    zap_u32(mdt) != 0x464c457f || mdt[4] != 1 || mdt[5] != 1 || mdt[6] != 1 ||
++	    zap_u16(mdt + 16) != 2 || zap_u16(mdt + 18) != 164 || zap_u32(mdt + 20) != 1 ||
++	    zap_u32(mdt + 24) != 0x5000 || zap_u32(mdt + 28) != 52 ||
++	    zap_u16(mdt + 40) != 52 || zap_u16(mdt + 42) != 32 || zap_u16(mdt + 44) != 3) {
++		return false;
++	}
++	const uint8_t *header = mdt + 52, *hash = header + 32, *load = hash + 32;
++	return zap_u32(header) == 0 && zap_u32(header + 4) == 0 &&
++	       zap_u32(header + 16) == 148 && zap_u32(header + 20) == 0 &&
++	       zap_u32(hash) == 0 && zap_u32(hash + 4) == 0x1000 &&
++	       zap_u32(hash + 12) == 0x6000 && zap_u32(hash + 16) == size - 148 &&
++	       zap_u32(hash + 20) == 0x2000 && zap_u32(hash + 24) == 0x02200000 &&
++	       zap_u32(load) == 1 && zap_u32(load + 4) == 0x3000 &&
++	       zap_u32(load + 12) == 0x5000 && zap_u32(load + 16) == code_size &&
++	       zap_u32(load + 20) == code_size && zap_u32(load + 24) == 0x08000007 &&
++	       zap_u32(load + 28) == ZAP_ALLOC_SIZE;
++}
++
++enum zap_result { ZAP_OK, ZAP_ERROR, ZAP_UNFINISHED };
++static enum zap_result
++zap_call(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2)
++{
++	struct scm_regs r;
++	const struct scm_regs initial = {
++		{ SCM_64 | SCM_SIP | 0x0200u | cmd, arginfo, SCM_PAS_GPU, arg1, arg2, 0, 0 }
++	};
++	printf("SWEET SCM: zap %s fn=%#llx info=%#x args=%#llx/%#llx/%#llx\n",
++	    name, initial.a[0], arginfo, initial.a[2], arg1, arg2);
++	sweet_log_sync();
++	__asm__ volatile("dsb sy" ::: "memory");
++	bool done = scm_invoke(&initial, false, &r);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET SCM: zap %s completed=%u status=%d result=%d\n",
++	    name, done, (int32_t)r.a[0], (int32_t)r.a[1]);
++	sweet_log_sync();
++	if (!done) {
++		return ZAP_UNFINISHED;
++	}
++	return (int32_t)r.a[0] == 0 && (int32_t)r.a[1] == 0 ? ZAP_OK : ZAP_ERROR;
++}
++
++/* Return true only if PAS never started or a completed shutdown quiesced it. */
++bool
++sweet_scm_gpu_zap_test(void)
++{
++	if (!scm_zap_ready || scm_zap_attempted) {
++		printf("SWEET SCM: zap test not ready or already attempted\n");
++		return !scm_zap_attempted;
++	}
++	scm_zap_attempted = true;
++	DTEntry node;
++	const uint8_t *mdt = NULL, *code = NULL;
++	unsigned mdt_size = 0, code_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-metadata", (const void **)&mdt, &mdt_size) != kSuccess ||
++	    SecureDTGetProperty(node, "zap-code", (const void **)&code, &code_size) != kSuccess ||
++	    !zap_valid(mdt, mdt_size, code, code_size)) {
++		printf("SWEET SCM: missing or unsupported a615_zap metadata/code\n");
++		return true;
++	}
++	/* One aligned, owned MiB for the protected image; metadata in a separate page. */
++	vm_offset_t kva;
++	const vm_size_t bytes = ZAP_ALLOC_SIZE + PAGE_SIZE;
++	if (kmem_alloc_contig(kernel_map, &kva, bytes, ZAP_ALLOC_SIZE - 1, 0, (ZAP_ALLOC_SIZE >> PAGE_SHIFT) - 1,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET SCM: zap contiguous allocation failed\n");
++		return true;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	uint64_t pa = ptoa_64(pn);
++	if (!pn || (pa & (ZAP_ALLOC_SIZE - 1))) {
++		printf("SWEET SCM: zap invalid allocation PA/alignment\n");
++		return true;
++	}
++	for (unsigned i = 0; i < bytes / PAGE_SIZE; ++i) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			printf("SWEET SCM: zap allocation not physically contiguous\n");
++			return true;
++		}
++	}
++	for (unsigned i = 0; i < bytes / PAGE_SIZE; ++i) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	flush_dcache64((addr64_t)pa, bytes, TRUE);
++	memcpy((void *)(kva + ZAP_ALLOC_SIZE), mdt, mdt_size);
++	printf("SWEET SCM: zap owned image=%#llx allocation=%#x logical=%#x metadata=%#llx/%u code=%u\n",
++	    pa, ZAP_ALLOC_SIZE, ZAP_LOGICAL_SIZE, pa + ZAP_ALLOC_SIZE, mdt_size, code_size);
++	/* SCM_ARGS(2, VAL, RW) = 2 | (2 << 6) = 0x82. Monitor verifies signatures. */
++	enum zap_result result = zap_call("INIT_IMAGE", 1, 0x82, pa + ZAP_ALLOC_SIZE, 0);
++	if (result != ZAP_OK) {
++		return result == ZAP_ERROR;
++	}
++	result = zap_call("MEM_SETUP", 2, 3, pa, ZAP_LOGICAL_SIZE);
++	if (result == ZAP_OK) {
++		memcpy((void *)kva, code, code_size);
++		result = zap_call("AUTH_AND_RESET", 5, 1, 0, 0);
++		if (result == ZAP_OK) {
++			printf("SWEET SCM: signed zap authenticated and started\n");
++			sweet_log_sync();
++		}
++	}
++	/* An unfinished secure operation gets no new calls, frees, or collapse. */
++	if (result == ZAP_UNFINISHED) {
++		return false;
++	}
++	bool stopped = zap_call("SHUTDOWN", 6, 1, 0, 0) == ZAP_OK;
++	printf("SWEET SCM: zap test shutdown=%s; allocation retained until reset\n", stopped ? "complete" : "failed");
++	sweet_log_sync();
++	return stopped;
++}
++
+ void
+ sweet_scm_probe(void)
+ {
+ 	int enabled = 0;
+ 	struct scm_regs r;
+ 	PE_parse_boot_argn("sweetscm", &enabled, sizeof(enabled));
+-	if (enabled < 1 || enabled > 3) {
++	if (enabled < 1 || enabled > 4) {
+ 		return;
+ 	}
+ 
+@@ -169,12 +315,16 @@
+ 		{ "PAS_SHUTDOWN available", 6 },
+ 		{ "PAS_IS_SUPPORTED available", 7 },
+ 	};
++	uint32_t available = 0;
+ 	for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+ 		uint32_t target = SCM_SIP | 0x0200u | queries[i].cmd;
+ 		if (!scm_logged_query(queries[i].name, mask | SCM_INFO_AVAIL, target, false, &r) ||
+ 		    (int32_t)r.a[0] != 0) {
+ 			return;
+ 		}
++		if (r.a[1]) {
++			available |= 1u << queries[i].cmd;
++		}
+ 	}
+ 	/* The last availability result describes the query itself, not PAS id 13. */
+ 	if (r.a[1] != 0) {
+@@ -188,7 +338,7 @@
+ 	if (enabled >= 2) {
+ 		scm_crypto_resources();
+ 	}
+-	if (enabled == 3) {
++	if (enabled >= 3) {
+ 		printf("SWEET SCM: enabling crypto bandwidth prerequisite\n");
+ 		sweet_log_sync();
+ 		int error = sweet_rpmh_crypto_bw();
+@@ -196,6 +346,10 @@
+ 		sweet_log_sync();
+ 		if (!error) {
+ 			scm_crypto_resources();
++			const uint32_t needed = (1u << 1) | (1u << 2) | (1u << 5) | (1u << 6);
++			scm_zap_ready = enabled == 4 && mask == SCM_64 && (available & needed) == needed;
++			printf("SWEET SCM: signed zap test ready=%u (requires sweetgpu=7)\n", scm_zap_ready);
++			sweet_log_sync();
+ 		}
+ 	}
+ }
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -41,6 +41,8 @@
+  *               (a6xx_gmu_gfx_rail_on) and SPTPRAC before HFI; after HFI
+  *               the oob_gpu request, the GX domain and GPU core registers
+  *               are read, then the GPU is sent to slumber.
++ *   sweetgpu=7  6 with a signed zap PAS load/auth/shutdown test while GX is
++ *               on (requires sweetscm=4). No CP commands are submitted.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -56,6 +58,7 @@
+ /* osfmk/vm/pmap.h, MACH_KERNEL_PRIVATE */
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool sweet_scm_gpu_zap_test(void);
+ extern void sweet_log_sync(void);       /* sweet_ufs.c */
+ extern int sweet_rpmh_arc_levels(const char *res, uint16_t *vals, unsigned max,
+     unsigned *num, uint32_t *address);  /* sweet_rpmh.c */
+@@ -1361,8 +1364,8 @@
+  * GX on; read the GX domain and the GPU core, then clear oob_gpu and the
+  * boot OOB as a successful start does, and send the GPU to slumber.
+  */
+-static void
+-gpu_gx_test(void)
++static bool
++gpu_gx_test(bool zap)
+ {
+ 	uint32_t gx_gdscr;
+ 
+@@ -1375,6 +1378,7 @@
+ 	gmu_oob_clear(OOB_BOOT_SLUMBER);
+ 	gpu_gx_slumber();
+ 	(void)gpu_report(&gx_gdscr);
++	return true;
+ }
+ 
+ /* Nothing services the GMU after the test: put it back into reset. */
+@@ -1514,7 +1518,9 @@
+ 			gx = rail && gpu_sptprac(true);
+ 		}
+ 		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
+-			gpu_gx_test();
++			if (!gpu_gx_test(mode >= 7)) {
++				return;
++			}
+ 		} else if (rail) {
+ 			/* GX was voted on but the start did not complete: power it down again. */
+ 			gmu_oob_clear(OOB_BOOT_SLUMBER);

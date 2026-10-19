@@ -43,7 +43,7 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
-# bsd/dev/sweet_gpu.c loads the Adreno 618 GMU firmware from /sweet-gpu.
+# The GPU/SCM drivers read GMU and signed zap firmware from /sweet-gpu.
 # Qualcomm firmware (kept out of git): copy it from the phone's vendor
 # partition, /vendor/firmware/a618_gmu.bin, into this directory.
 GPU_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/gpu/fw')
@@ -218,11 +218,22 @@ def build(seed=None, qemu=False, highmem=False):
 
     gmu_fw = os.path.join(GPU_FW_DIR, 'a618_gmu.bin')
     if os.path.exists(gmu_fw):
-        gpu = [node('sweet-gpu', [
+        gpu_props = [
             ph(),
             ('compatible', cstr('qcom,adreno-618.0')),
             ('gmu-firmware', open(gmu_fw, 'rb').read()),
-        ])]
+        ]
+        zap_files = [('zap-metadata', 'a615_zap.mdt', 8192),
+                     ('zap-code', 'a615_zap.b02', 4096)]
+        if all(os.path.exists(os.path.join(GPU_FW_DIR, name)) for _, name, _ in zap_files):
+            for prop, name, limit in zap_files:
+                blob = open(os.path.join(GPU_FW_DIR, name), 'rb').read()
+                if not 0 < len(blob) <= limit:
+                    raise ValueError(f'{name}: invalid firmware size {len(blob)}')
+                gpu_props.append((prop, blob))
+        else:
+            print('warning: a615_zap metadata/code missing; signed PAS test unavailable', file=sys.stderr)
+        gpu = [node('sweet-gpu', gpu_props)]
     else:
         print(f'warning: {gmu_fw} missing, no /sweet-gpu node', file=sys.stderr)
         gpu = []
