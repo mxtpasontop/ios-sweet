@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1373,6 +1373,16 @@
+ 		(void)gpu_report(&gx_gdscr);
+ 		gpu_report_gmu(gx_gdscr);
+ 		sweet_log_sync();
++		if (zap) {
++			if (!(gx_gdscr & GDSC_PWR_ON)) {
++				printf("SWEET GPU: zap skipped: GX not powered\n");
++				sweet_log_sync();
++			} else if (!sweet_scm_gpu_zap_test()) {
++				printf("SWEET GPU: zap operation not quiesced; retaining GX/GMU until reset\n");
++				sweet_log_sync();
++				return false;
++			}
++		}
+ 	}
+ 	gmu_oob_clear(OOB_GPU);
+ 	gmu_oob_clear(OOB_BOOT_SLUMBER);
