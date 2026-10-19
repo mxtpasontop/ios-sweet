@@ -17,25 +17,29 @@ PRELUDE = r'''
 #define OOB_BOOT_SLUMBER 6
 #define GDSC_PWR_ON (1u<<31)
 #define CHECK(x) do { if(!(x)){fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);abort();} } while(0)
-static bool ack,powered,stopped;
-static unsigned calls,clears,slumbers,reports,syncs;
+static bool ack,powered,stopped,configured;
+static unsigned calls,clears,slumbers,reports,syncs,configs;
 static bool gmu_oob_set(unsigned req,const char *name){CHECK(req==0 && !strcmp(name,"gpu"));return ack;}
 static bool gpu_report(uint32_t *v){reports++;*v=powered?GDSC_PWR_ON:0;return true;}
 static void gpu_report_gmu(uint32_t v){CHECK(v==(powered?GDSC_PWR_ON:0));}
 static void sweet_log_sync(void){syncs++;}
 static bool sweet_scm_gpu_zap_test(void){CHECK(ack && powered && !clears && !slumbers);calls++;return stopped;}
+static bool gpu_cp_configure_halted(void){CHECK(ack && powered && calls==1 && stopped && !clears && !slumbers);configs++;return configured;}
 static void gmu_oob_clear(unsigned req){CHECK(req==(clears?OOB_BOOT_SLUMBER:OOB_GPU));clears++;}
 static void gpu_gx_slumber(void){CHECK(clears==2);slumbers++;}
 '''
 MAIN = r'''
-static void fixture(void){ack=powered=stopped=true;calls=clears=slumbers=reports=syncs=0;}
+static void fixture(void){ack=powered=stopped=configured=true;calls=clears=slumbers=reports=syncs=configs=0;}
 int main(void){
-    fixture();CHECK(gpu_gx_test(true) && calls==1 && clears==2 && slumbers==1);
-    fixture();CHECK(gpu_gx_test(false) && !calls && clears==2 && slumbers==1);
-    fixture();stopped=false;CHECK(!gpu_gx_test(true) && calls==1 && !clears && !slumbers && syncs==2);
-    fixture();ack=false;CHECK(gpu_gx_test(true) && !calls && clears==2 && slumbers==1);
-    fixture();powered=false;CHECK(gpu_gx_test(true) && !calls && clears==2 && slumbers==1);
-    puts("GPU zap hook: invocation, disabled mode, uncertain PAS, failed OOB and unpowered GX passed");
+    fixture();CHECK(gpu_gx_test(true,false) && calls==1 && !configs && clears==2 && slumbers==1);
+    fixture();CHECK(gpu_gx_test(false,false) && !calls && !configs && clears==2 && slumbers==1);
+    fixture();stopped=false;CHECK(!gpu_gx_test(true,false) && calls==1 && !configs && !clears && !slumbers && syncs==2);
+    fixture();ack=false;CHECK(gpu_gx_test(true,true) && !calls && !configs && clears==2 && slumbers==1);
+    fixture();powered=false;CHECK(gpu_gx_test(true,true) && !calls && !configs && clears==2 && slumbers==1);
+    fixture();CHECK(gpu_gx_test(true,true) && calls==1 && configs==1 && clears==2 && slumbers==1);
+    fixture();configured=false;CHECK(!gpu_gx_test(true,true) && calls==1 && configs==1 && !clears && !slumbers);
+    fixture();stopped=false;CHECK(!gpu_gx_test(true,true) && calls==1 && !configs && !clears && !slumbers);
+    puts("GPU zap/CP hooks: mode gates, powered PAS -> halted CP order, failures retaining power passed");
 }
 '''
 
@@ -52,7 +56,7 @@ def main():
                                input=''.join(chosen), text=True, check=True)
         src = (d / 'bsd/dev/sweet_gpu.c').read_text()
         func = src[src.index('static bool\ngpu_gx_test('):src.index('/* Nothing services the GMU')]
-        assert 'gpu_gx_test(mode >= 7)' in src
+        assert 'gpu_gx_test(mode >= 7, mode >= 9)' in src
         c = d / 'test.c'
         c.write_text(PRELUDE + func + MAIN)
         exe = d / 'test'

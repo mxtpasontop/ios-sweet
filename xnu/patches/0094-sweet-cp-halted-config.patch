@@ -1,0 +1,171 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,6 +45,8 @@
+  *               on (requires sweetscm=4). No CP commands are submitted.
+  *   sweetgpu=8  7 plus CP buffers, original SQE firmware, and SID0/CB1 tables;
+  *               readback and software walks only (DT disables ATOS).
++ *   sweetgpu=9  8 plus halted CP ring/SQE register setup after the PAS test;
++ *               SQE stays halted and no commands are submitted.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -1167,6 +1169,129 @@
+ }
+ /* End CP memory stage. */
+ 
++/* Halted register stage. Register indices are DWORDs, not byte offsets.
++ * Phone kernel 1bc20ec6: a6xx_start, a6xx_rb_start, a6xx_microcode_load;
++ * upstream v6.1 a6xx_recover uses SQE_CNTL=3 to halt. No engine start here.
++ */
++#define A6XX_CP_RB_BASE            0x800u
++#define A6XX_CP_RB_BASE_HI         0x801u
++#define A6XX_CP_RB_CNTL            0x802u
++#define A6XX_CP_RB_RPTR_ADDR_LO    0x804u
++#define A6XX_CP_RB_RPTR_ADDR_HI    0x805u
++#define A6XX_CP_RB_RPTR            0x806u
++#define A6XX_CP_RB_WPTR            0x807u
++#define A6XX_CP_SQE_CNTL           0x808u
++#define A6XX_CP_HW_FAULT           0x821u
++#define A6XX_CP_INTERRUPT_STATUS   0x823u
++#define A6XX_CP_ROQ_THRESHOLDS_1   0x8c1u
++#define A6XX_CP_ROQ_THRESHOLDS_2   0x8c2u
++#define A6XX_CP_MEM_POOL_SIZE      0x8c3u
++#define A6XX_CP_AHB_CNTL           0x98du
++#define A6XX_RBBM_INT_0_STATUS     0x201u
++/* 32 KiB = 8192 dwords = 4096 quadwords; 4-dword RPTR update threshold.
++ * Bit27 disables automatic RPTR shadow writes for this first register test.
++ */
++#define CP_RING_CNTL ((1u << 27) | (2u << 8) | 12u)
++
++static bool
++gpu_cp_context_intact(vm_offset_t smmu)
++{
++	vm_offset_t cb = smmu + SMMU_CB(CP_CB);
++	uint64_t ttbr = cp_memory_pa | ((uint64_t)CP_ASID << 48);
++	uint32_t fsr = gpu_rd(cb, SMMU_CB_FSR), gfsr = gpu_rd(smmu, SMMU_sGFSR);
++	bool ok = gpu_rd(cb, SMMU_CB_SCTLR) == SCTLR_GMU &&
++	    gpu_rd(cb, SMMU_CB_TCR) == TTBCR_GMU && gpu_rd(cb, SMMU_CB_TTBCR2) == TTBCR2_GMU &&
++	    gpu_rd(cb, SMMU_CB_TTBR0) == (uint32_t)ttbr &&
++	    gpu_rd(cb, SMMU_CB_TTBR0 + 4) == (uint32_t)(ttbr >> 32) &&
++	    gpu_rd(cb, SMMU_CB_MAIR0) == MAIR0_GMU && gpu_rd(cb, SMMU_CB_MAIR1) == 0 &&
++	    (gpu_rd(smmu, SMMU_GR1 + SMMU_CBA2R(CP_CB)) & CBA2R_RW64_64BIT) &&
++	    (gpu_rd(smmu, SMMU_GR1 + SMMU_CBAR(CP_CB)) & 0x3f300u) == CBAR_S1_BYPASS_S2 &&
++	    gpu_rd(smmu, SMMU_SMR(CP_SMR)) == SMR_VALID &&
++	    gpu_rd(smmu, SMMU_S2CR(CP_SMR)) == S2CR_TRANS_CB(CP_CB) &&
++	    gpu_rd(smmu, SMMU_SMR(0)) == (SMR_VALID | 5u) &&
++	    gpu_rd(smmu, SMMU_SMR(1)) == (SMR_VALID | 4u) &&
++	    gpu_rd(smmu, SMMU_S2CR(0)) == S2CR_TRANS_CB(0) &&
++	    gpu_rd(smmu, SMMU_S2CR(1)) == S2CR_TRANS_CB(0) &&
++	    !(fsr & 0xc00001feu) && !gfsr;
++	printf("SWEET GPU: CP post-PAS context %s FSR=%#x GFSR=%#x TTBR=%#x%08x\n",
++	    ok ? "intact" : "changed/faulted", fsr, gfsr,
++	    gpu_rd(cb, SMMU_CB_TTBR0 + 4), gpu_rd(cb, SMMU_CB_TTBR0));
++	return ok;
++}
++
++static bool
++gpu_cp_configure_halted(void)
++{
++	if (!cp_memory || !cp_memory_pa) {
++		printf("SWEET GPU: CP register setup missing owned memory\n");
++		return false;
++	}
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!smmu || !gpu || !gpu_cp_context_intact(smmu) || !cp_check_tables()) {
++		printf("SWEET GPU: CP register setup prerequisite failed\n");
++		return false;
++	}
++	printf("SWEET GPU: CP before halt SQE_CNTL=%#x RB=%#x/%#x SQE=%#x/%#x RPTR=%#x WPTR=%#x\n",
++	    gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_BASE * 4),
++	    gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4), gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4),
++	    gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4),
++	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(gpu, A6XX_CP_RB_WPTR * 4));
++	sweet_log_sync();
++	gpu_wr(gpu, A6XX_CP_SQE_CNTL * 4, 3);
++	if (!gpu_poll(gpu, A6XX_CP_SQE_CNTL * 4, 3, 3, 1000)) {
++		printf("SWEET GPU: CP halt readback failed\n");
++		return false;
++	}
++	/* A cold, unsubmitted ring is required; do not overwrite inherited work. */
++	if (gpu_rd(gpu, A6XX_CP_RB_BASE * 4) || gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) ||
++	    gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4) ||
++	    gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4) ||
++	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) || gpu_rd(gpu, A6XX_CP_RB_WPTR * 4)) {
++		printf("SWEET GPU: CP has inherited ring/SQE state; setup stopped\n");
++		return false;
++	}
++	/* a618 thresholds and pool size from the phone driver; no UCHE/rendering
++	 * setup or protected/security register access in this stage.
++	 */
++	const struct { uint32_t reg, value; } setup[] = {
++		{ A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0 },
++		{ A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c },
++		{ A6XX_CP_MEM_POOL_SIZE, 128 },
++		{ A6XX_CP_AHB_CNTL, 1 },
++		{ A6XX_CP_RB_RPTR_ADDR_LO, cp_buffers[2].va },
++		{ A6XX_CP_RB_RPTR_ADDR_HI, 0 },
++		{ A6XX_CP_RB_CNTL, CP_RING_CNTL },
++		{ A6XX_CP_RB_BASE, cp_buffers[0].va },
++		{ A6XX_CP_RB_BASE_HI, 0 },
++		{ A6XX_CP_SQE_INSTR_BASE_LO, cp_buffers[1].va },
++		{ A6XX_CP_SQE_INSTR_BASE_LO + 1, 0 },
++	};
++	for (unsigned i = 0; i < sizeof(setup) / sizeof(setup[0]); ++i) {
++		gpu_wr(gpu, setup[i].reg * 4, setup[i].value);
++		uint32_t got = gpu_rd(gpu, setup[i].reg * 4);
++		printf("SWEET GPU: CP reg[%#x] wrote=%#x read=%#x\n", setup[i].reg, setup[i].value, got);
++		if (got != setup[i].value) {
++			printf("SWEET GPU: CP halted configuration readback mismatch\n");
++			return false;
++		}
++	}
++	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
++	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
++	printf("SWEET GPU: CP halted status SQE_CNTL=%#x RPTR=%#x WPTR=%#x HW_FAULT=%#x CP_IRQ=%#x RBBM_IRQ=%#x\n",
++	    gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_RPTR * 4),
++	    gpu_rd(gpu, A6XX_CP_RB_WPTR * 4), fault, irq, gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	if (fault || irq || gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4) != 3 ||
++	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) || gpu_rd(gpu, A6XX_CP_RB_WPTR * 4) ||
++	    !gpu_cp_context_intact(smmu)) {
++		return false;
++	}
++	printf("SWEET GPU: CP halted configuration verified; no commands submitted\n");
++	sweet_log_sync();
++	return true;
++}
++/* End halted CP register stage. */
++
+ static void
+ gpu_smmu_cb_faults(void)
+ {
+@@ -1593,7 +1718,7 @@
+  * boot OOB as a successful start does, and send the GPU to slumber.
+  */
+ static bool
+-gpu_gx_test(bool zap)
++gpu_gx_test(bool zap, bool cp)
+ {
+ 	uint32_t gx_gdscr;
+ 
+@@ -1610,6 +1735,11 @@
+ 				sweet_log_sync();
+ 				return false;
+ 			}
++		}
++		if (cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_configure_halted()) {
++			printf("SWEET GPU: CP setup failed; retaining GX/GMU until reset\n");
++			sweet_log_sync();
++			return false;
+ 		}
+ 	}
+ 	gmu_oob_clear(OOB_GPU);
+@@ -1761,7 +1891,7 @@
+ 			gx = rail && gpu_sptprac(true);
+ 		}
+ 		if (booted && (mode < 6 || gx) && gpu_hfi_start() && mode >= 6) {
+-			if (!gpu_gx_test(mode >= 7)) {
++			if (!gpu_gx_test(mode >= 7, mode >= 9)) {
+ 				return;
+ 			}
+ 		} else if (rail) {
