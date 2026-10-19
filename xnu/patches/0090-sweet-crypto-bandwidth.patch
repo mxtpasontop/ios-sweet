@@ -1,0 +1,271 @@
+--- a/bsd/dev/sweet_rpmh.h
++++ b/bsd/dev/sweet_rpmh.h
+@@ -14,4 +14,6 @@
+ 
+ /* Read-only lookup: no RPMh votes or TCS register writes. */
+ int sweet_rpmh_bcm_info(const char *res, struct sweet_rpmh_bcm *info);
++/* Board crypto -> DDR ACTIVE vote, retained for this boot; no release API. */
++int sweet_rpmh_crypto_bw(void);
+ #endif
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -219,9 +219,16 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* Serialized ACTIVE payload transport, shared by the LDO and crypto clients. */
++struct rh_command { uint32_t address, data; };
+ static int
+-rh_send(uint32_t address, unsigned mv)
+-{
++rh_send_commands(const struct rh_command *commands, unsigned count, uint32_t wait)
++{
++	if (!commands || !count || count > rh_ncpt || count > 16 ||
++	    (wait & ~((1u << count) - 1u))) {
++		return EINVAL;
++	}
++	uint32_t enable = (1u << count) - 1u;
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -233,10 +240,17 @@
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
++			if (!(enabled & (1u << c))) {
++				continue;
++			}
++			uint32_t inherited = rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE);
++			for (unsigned n = 0; n < count; ++n) {
++				/* VRM has four registers; BCM addresses identify individual votes. */
++				uint32_t mask = (commands[n].address >> 16) == RH_VRM ? ~15u : ~0u;
++				if ((inherited & mask) == (commands[n].address & mask)) {
++					printf("SWEET RPMH: conflicting inherited request in TCS%u addr=%#x\n", t, inherited);
++					return EBUSY;
++				}
+ 			}
+ 		}
+ 		if (chosen < 0 && rh_free(t)) {
+@@ -267,30 +281,27 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE commands=%u wait=%#x irq-enable=%#x\n", t, count, wait, irq_en);
++	for (unsigned c = 0; c < count; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
++		    !rh_sync(cmd + RH_ADDR, commands[c].address) ||
++		    !rh_sync(cmd + RH_DATA, commands[c].data)) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, wait) || !rh_sync(b + RH_ENABLE, enable) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[16] = {0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < count; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -321,7 +332,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE payload complete\n");
+ 	return 0;
+ }
+ 
+@@ -347,7 +358,11 @@
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const struct rh_command commands[] = {
++			{ address, mv }, { address + 8, 7 }, { address + 4, 1 }
++		};
++		error = rh_send_commands(commands, 3, 7);
+ 	}
+ out:
+ 	if (error) {
+@@ -514,4 +529,117 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Downstream msm_bus path 125 -> 512, live sweet FDT. Units are bytes/s.
++ * Only this client is represented here. Shared DDR votes remain held for the
++ * boot: releasing an inherited apps-DRV vote requires global ownership tracking.
++ */
++#define RH_CRYPTO_COUNT 6u
++static bool rh_crypto_held;
++static uint64_t
++rh_bcm_div(uint64_t value, uint32_t divisor)
++{
++	return value && value < divisor ? 1 : value / divisor;
++}
++
++static int
++rh_crypto_plan(const struct sweet_rpmh_bcm info[RH_CRYPTO_COUNT],
++    struct rh_command commands[RH_CRYPTO_COUNT], uint32_t *wait)
++{
++	/* Order before sorting: CE0, SN11, SN0, SH0, MC0, ACV. */
++	static const uint16_t widths[] = { 8, 16, 16, 16, 4, 0 };
++	static const uint16_t ports[] = { 1, 1, 1, 2, 2, 0 };
++	const uint64_t average = 393600000ULL, peak = 3936000000ULL;
++	uint8_t domains[RH_CRYPTO_COUNT];
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		const struct sweet_rpmh_bcm *b = &info[i];
++		if (b->version != 0x1000 || b->reserved || !b->unit || b->vcd >= 16 ||
++		    (b->address >> 16) != RH_BCM || (b->address & 3u) ||
++		    (i < 5 && (!b->width || b->width > 64)) ||
++		    (i == 5 && (b->width != 0 || b->unit != 1))) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < i; ++j) {
++			if (info[j].address == b->address) {
++				return EINVAL;
++			}
++		}
++		uint64_t x = 0, y = 8; /* BCM ACV: apps bit, msm_bus_arb_rpmh.c. */
++		if (i < 5) {
++			x = rh_bcm_div(rh_bcm_div(average * b->width, widths[i] * ports[i]), b->unit);
++			y = rh_bcm_div(rh_bcm_div(peak * b->width, widths[i]), b->unit);
++		}
++		x = MIN(x, 0x3fffULL);
++		y = MIN(y, 0x3fffULL);
++		commands[i].address = b->address;
++		commands[i].data = (1u << 29) | ((uint32_t)x << 14) | (uint32_t)y;
++		domains[i] = b->vcd;
++	}
++	/* All commands for a VCD must precede that VCD's final commit. */
++	for (unsigned i = 1; i < RH_CRYPTO_COUNT; ++i) {
++		unsigned j = i;
++		while (j && domains[j] < domains[j - 1]) {
++			uint8_t domain = domains[j];
++			domains[j] = domains[j - 1]; domains[j - 1] = domain;
++			struct rh_command cmd = commands[j];
++			commands[j] = commands[j - 1]; commands[j - 1] = cmd;
++			j--;
++		}
++	}
++	*wait = 0;
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		if (i + 1 == RH_CRYPTO_COUNT || domains[i] != domains[i + 1]) {
++			commands[i].data |= 1u << 30;
++			*wait |= 1u << i;
++		}
++	}
++	return 0;
++}
++
++int
++sweet_rpmh_crypto_bw(void)
++{
++	static const char *const names[] = { "CE0", "SN11", "SN0", "SH0", "MC0", "ACV" };
++	struct sweet_rpmh_bcm info[RH_CRYPTO_COUNT];
++	struct rh_command commands[RH_CRYPTO_COUNT];
++	uint32_t wait;
++	/* Read/validate every descriptor before touching any TCS. */
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		int error = sweet_rpmh_bcm_info(names[i], &info[i]);
++		if (error) {
++			return error;
++		}
++	}
++	int error = rh_crypto_plan(info, commands, &wait);
++	if (error) {
++		return error;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		error = EIO;
++		goto out;
++	}
++	if (rh_crypto_held) {
++		goto out;
++	}
++	error = rh_map();
++	if (error) {
++		goto out;
++	}
++	for (unsigned i = 0; i < RH_CRYPTO_COUNT; ++i) {
++		printf("SWEET RPMH: crypto BCM[%u] addr=%#x data=%#x wait=%u\n",
++		    i, commands[i].address, commands[i].data, !!(wait & (1u << i)));
++	}
++	error = rh_send_commands(commands, RH_CRYPTO_COUNT, wait);
++	if (!error) {
++		rh_crypto_held = true;
++		printf("SWEET RPMH: crypto bandwidth held until reset\n");
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_scm.c
++++ b/bsd/dev/sweet_scm.c
+@@ -6,7 +6,8 @@
+  * drivers/firmware/qcom/qcom_scm-smc.c (QCOM_A6 continuation quirk).
+  * Only INFO/IS_CALL_AVAIL and PIL/PAS_IS_SUPPORTED are invoked here.
+  * sweetscm=2 also reports crypto-path BCM descriptors and GCC clock state.
+- * No firmware loading, memory ownership changes, RPMh votes, or register writes.
++ * sweetscm=3 adds crypto bandwidth votes only (held until reset).
++ * No firmware loading, memory ownership changes, or direct clock writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -134,7 +135,7 @@
+ 	int enabled = 0;
+ 	struct scm_regs r;
+ 	PE_parse_boot_argn("sweetscm", &enabled, sizeof(enabled));
+-	if (enabled != 1 && enabled != 2) {
++	if (enabled < 1 || enabled > 3) {
+ 		return;
+ 	}
+ 
+@@ -184,8 +185,18 @@
+ 	}
+ 	printf("SWEET SCM: availability probe complete\n");
+ 	sweet_log_sync();
+-	if (enabled == 2) {
++	if (enabled >= 2) {
+ 		scm_crypto_resources();
+ 	}
++	if (enabled == 3) {
++		printf("SWEET SCM: enabling crypto bandwidth prerequisite\n");
++		sweet_log_sync();
++		int error = sweet_rpmh_crypto_bw();
++		printf("SWEET SCM: crypto bandwidth result errno=%d\n", error);
++		sweet_log_sync();
++		if (!error) {
++			scm_crypto_resources();
++		}
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
