@@ -233,6 +233,12 @@ def build(seed=None, qemu=False, highmem=False):
                 gpu_props.append((prop, blob))
         else:
             print('warning: a615_zap metadata/code missing; signed PAS test unavailable', file=sys.stderr)
+        sqe_path = os.path.join(GPU_FW_DIR, 'a630_sqe.fw')
+        if os.path.exists(sqe_path):
+            sqe = open(sqe_path, 'rb').read()
+            if not 16 <= len(sqe) <= 0x8004 or len(sqe) % 4:
+                raise ValueError(f'a630_sqe.fw: invalid firmware size {len(sqe)}')
+            gpu_props.append(('sqe-firmware', sqe))
         gpu = [node('sweet-gpu', gpu_props)]
     else:
         print(f'warning: {gmu_fw} missing, no /sweet-gpu node', file=sys.stderr)

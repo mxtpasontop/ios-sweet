@@ -1,0 +1,256 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -43,6 +43,8 @@
+  *               are read, then the GPU is sent to slumber.
+  *   sweetgpu=7  6 with a signed zap PAS load/auth/shutdown test while GX is
+  *               on (requires sweetscm=4). No CP commands are submitted.
++ *   sweetgpu=8  7 plus CP buffers, original SQE firmware, and SID0/CB1 tables;
++ *               readback and software walks only (DT disables ATOS).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -939,6 +941,232 @@
+ 	return SMMU_ROUTED;
+ }
+ 
++/* CP memory stage: resources only; SQE and the ring are not started here. */
++#define CP_CB 1u
++#define CP_ASID 2u
++#define CP_SMR 2u
++#define CP_MEMORY_SIZE 0x20000u
++#define CP_L1 0u
++#define CP_L2 0x1000u
++#define CP_L3 0x2000u
++#define CP_PA_MASK ((1ull << 36) - 0x1000ull)
++#define CP_GPU_VA 0x40000000u
++static vm_offset_t cp_memory;
++static uint64_t cp_memory_pa;
++static const struct {
++	const char *name;
++	uint32_t va, off, size;
++	bool readonly;
++} cp_buffers[] = {
++	{ "ring",    0x40000000u, 0x04000u, 0x8000u, false },
++	{ "sqe",     0x40010000u, 0x0c000u, 0x8000u, true },
++	{ "scratch", 0x40020000u, 0x14000u, 0x4000u, false },
++};
++
++static uint32_t
++cp_fw_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static bool
++cp_fw_valid(const uint8_t *fw, unsigned size)
++{
++	if (!fw || size < 16 || size > 0x8004 || (size & 3) || cp_fw_u32(fw) != 0) {
++		return false;
++	}
++	uint32_t version = cp_fw_u32(fw + 4), patch = cp_fw_u32(fw + 12);
++	/* Upstream a6xx_ucode_check_version after stripping the file header. */
++	return ((version & 0xf) == 0xa && (patch & 0xf) >= 1) || (version & 0xfff) >= 0x190;
++}
++
++static void
++cp_write64(vm_offset_t base, uint32_t off, uint64_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint64_t *)(base + off) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++cp_build_tables(void)
++{
++	cp_write64(cp_memory, CP_L1 + 8 * (CP_GPU_VA >> 30), (cp_memory_pa + CP_L2) | PTE_TABLE);
++	cp_write64(cp_memory, CP_L2, (cp_memory_pa + CP_L3) | PTE_TABLE);
++	for (unsigned i = 0; i < sizeof(cp_buffers) / sizeof(cp_buffers[0]); ++i) {
++		for (uint32_t off = 0; off < cp_buffers[i].size; off += 0x1000) {
++			uint32_t index = ((cp_buffers[i].va + off) >> 12) & 0x1ff;
++			uint64_t pte = (cp_memory_pa + cp_buffers[i].off + off) | PTE_PAGE_NC;
++			if (cp_buffers[i].readonly) {
++				pte |= 1ull << 7; /* stage-1 AP[2]: read-only, including privileged fetches */
++			}
++			cp_write64(cp_memory, CP_L3 + 8 * index, pte);
++		}
++	}
++}
++
++/* Software walk only: the live GPU SMMU DT explicitly sets qcom,disable-atos. */
++static bool
++cp_walk(uint32_t va, bool write, uint64_t *pa)
++{
++	uint32_t offset = CP_L1;
++	const unsigned shifts[] = { 30, 21, 12 };
++	for (unsigned level = 0; level < 3; ++level) {
++		uint64_t pte = *(volatile uint64_t *)(cp_memory + offset + 8 * ((va >> shifts[level]) & 0x1ff));
++		if ((pte & 3) != PTE_TABLE) {
++			return false;
++		}
++		if (level == 2) {
++			if (!(pte & (1ull << 10)) || (write && (pte & (1ull << 7)))) {
++				return false;
++			}
++			*pa = (pte & CP_PA_MASK) | (va & 0xfff);
++			return true;
++		}
++		uint64_t table = pte & CP_PA_MASK;
++		if (table < cp_memory_pa || table - cp_memory_pa > CP_MEMORY_SIZE - 0x1000) {
++			return false;
++		}
++		offset = (uint32_t)(table - cp_memory_pa);
++	}
++	return false;
++}
++
++static bool
++cp_check_tables(void)
++{
++	unsigned pages = 0;
++	uint64_t pa;
++	for (unsigned i = 0; i < sizeof(cp_buffers) / sizeof(cp_buffers[0]); ++i) {
++		for (uint32_t off = 0; off < cp_buffers[i].size; off += 0x1000) {
++			uint64_t want = cp_memory_pa + cp_buffers[i].off + off;
++			if (!cp_walk(cp_buffers[i].va + off, false, &pa) || pa != want ||
++			    !cp_walk(cp_buffers[i].va + off + 0xfff, false, &pa) || pa != want + 0xfff ||
++			    cp_walk(cp_buffers[i].va + off, true, &pa) == cp_buffers[i].readonly) {
++				return false;
++			}
++			pages++;
++		}
++	}
++	static const uint32_t holes[] = { 0, 0x3ffff000u, 0x40008000u, 0x40018000u, 0x40024000u, 0xffffffffu };
++	for (unsigned i = 0; i < sizeof(holes) / sizeof(holes[0]); ++i) {
++		if (cp_walk(holes[i], false, &pa)) {
++			return false;
++		}
++	}
++	printf("SWEET GPU: CP software walk: %u pages, read-only SQE and %u unmapped guards verified\n",
++	    pages, (unsigned)(sizeof(holes) / sizeof(holes[0])));
++	return true;
++}
++
++static bool
++gpu_cp_memory_setup(void)
++{
++	DTEntry node;
++	const uint8_t *fw = NULL;
++	unsigned size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "sqe-firmware", (const void **)&fw, &size) != kSuccess || !cp_fw_valid(fw, size)) {
++		printf("SWEET GPU: CP missing or unsupported a630 SQE firmware\n");
++		return false;
++	}
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!smmu || gpu_rd(smmu, SMMU_CB(CP_CB) + SMMU_CB_SCTLR) ||
++	    gpu_rd(smmu, SMMU_CB(CP_CB) + SMMU_CB_TTBR0) ||
++	    gpu_rd(smmu, SMMU_CB(CP_CB) + SMMU_CB_TTBR0 + 4) ||
++	    (gpu_rd(smmu, SMMU_SMR(CP_SMR)) & SMR_VALID)) {
++		printf("SWEET GPU: CP SMMU bank/slot unavailable\n");
++		return false;
++	}
++	unsigned entries = gpu_rd(smmu, SMMU_IDR0) & 0xff;
++	if (entries != 5) {
++		return false;
++	}
++	for (unsigned i = 0; i < entries; ++i) {
++		uint32_t smr = gpu_rd(smmu, SMMU_SMR(i));
++		uint32_t mask = (smr >> 16) & 0x7fff, sid = smr & 0x7fff;
++		if (smr & SMR_VALID) {
++			uint32_t s2cr = gpu_rd(smmu, SMMU_S2CR(i));
++			if (!(sid & ~mask) || ((s2cr & (3u << 16)) == 0 && (s2cr & 0xff) == CP_CB)) {
++				printf("SWEET GPU: CP SID0/CB%u already owned by SMR%u\n", CP_CB, i);
++				return false;
++			}
++		}
++	}
++	if (kmem_alloc_contig(kernel_map, &cp_memory, CP_MEMORY_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: CP memory allocation failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)cp_memory);
++	cp_memory_pa = ptoa_64(pn);
++	if (!pn || cp_memory_pa + CP_MEMORY_SIZE > (1ull << 36)) {
++		return false;
++	}
++	for (unsigned i = 0; i < CP_MEMORY_SIZE / PAGE_SIZE; ++i) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(cp_memory + i * PAGE_SIZE)) != pn + i) {
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < CP_MEMORY_SIZE / PAGE_SIZE; ++i) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	flush_dcache64(cp_memory_pa, CP_MEMORY_SIZE, TRUE);
++	memcpy((void *)(cp_memory + cp_buffers[1].off), fw + 4, size - 4);
++	if (memcmp((const void *)(cp_memory + cp_buffers[1].off), fw + 4, size - 4)) {
++		return false;
++	}
++	cp_build_tables();
++	if (!cp_check_tables()) {
++		return false;
++	}
++	printf("SWEET GPU: CP resources at %#llx SQE=%u bytes version=%#x patch=%#x\n",
++	    cp_memory_pa, size - 4, cp_fw_u32(fw + 4), cp_fw_u32(fw + 12));
++	for (unsigned i = 0; i < sizeof(cp_buffers) / sizeof(cp_buffers[0]); ++i) {
++		printf("SWEET GPU: CP %s VA=%#x PA=%#llx size=%#x readonly=%u\n", cp_buffers[i].name,
++		    cp_buffers[i].va, cp_memory_pa + cp_buffers[i].off, cp_buffers[i].size, cp_buffers[i].readonly);
++	}
++	sweet_log_sync();
++	vm_offset_t cb = smmu + SMMU_CB(CP_CB);
++	uint64_t ttbr = (cp_memory_pa + CP_L1) | ((uint64_t)CP_ASID << 48);
++	gpu_wr(smmu, SMMU_GR1 + SMMU_CBA2R(CP_CB), CBA2R_RW64_64BIT);
++	gpu_wr(smmu, SMMU_GR1 + SMMU_CBAR(CP_CB), CBAR_S1_BYPASS_S2);
++	gpu_wr(cb, SMMU_CB_TTBCR2, TTBCR2_GMU);
++	gpu_wr(cb, SMMU_CB_TCR, TTBCR_GMU);
++	cp_write64(cb, SMMU_CB_TTBR0, ttbr);
++	gpu_wr(cb, SMMU_CB_MAIR0, MAIR0_GMU);
++	gpu_wr(cb, SMMU_CB_MAIR1, 0);
++	gpu_wr(cb, SMMU_CB_ACTLR, ACTLR_QCOM);
++	gpu_wr(cb, SMMU_CB_FSR, gpu_rd(cb, SMMU_CB_FSR));
++	gpu_wr(cb, SMMU_CB_TLBIALL, 0);
++	if (!smmu_sync(cb, SMMU_CB_TLBSYNC, SMMU_CB_TLBSTATUS)) {
++		return false;
++	}
++	gpu_wr(cb, SMMU_CB_SCTLR, SCTLR_GMU);
++	if (!(gpu_rd(smmu, SMMU_GR1 + SMMU_CBA2R(CP_CB)) & CBA2R_RW64_64BIT) ||
++	    (gpu_rd(smmu, SMMU_GR1 + SMMU_CBAR(CP_CB)) & 0x3f300u) != CBAR_S1_BYPASS_S2 ||
++	    gpu_rd(cb, SMMU_CB_SCTLR) != SCTLR_GMU || gpu_rd(cb, SMMU_CB_TCR) != TTBCR_GMU ||
++	    gpu_rd(cb, SMMU_CB_TTBCR2) != TTBCR2_GMU || gpu_rd(cb, SMMU_CB_TTBR0) != (uint32_t)ttbr ||
++	    gpu_rd(cb, SMMU_CB_TTBR0 + 4) != (uint32_t)(ttbr >> 32) || gpu_rd(cb, SMMU_CB_MAIR0) != MAIR0_GMU) {
++		printf("SWEET GPU: CP context readback mismatch\n");
++		return false;
++	}
++	smmu_write_sme(smmu, CP_SMR, S2CR_TRANS_CB(CP_CB), SMR_VALID, "CP user SID0");
++	gpu_wr(smmu, SMMU_TLBIALLNSNH, 0);
++	if (!smmu_sync(smmu, SMMU_sTLBGSYNC, SMMU_sTLBGSTATUS) ||
++	    gpu_rd(smmu, SMMU_SMR(CP_SMR)) != SMR_VALID ||
++	    gpu_rd(smmu, SMMU_S2CR(CP_SMR)) != S2CR_TRANS_CB(CP_CB) ||
++	    gpu_rd(smmu, SMMU_sGFSR) || (gpu_rd(cb, SMMU_CB_FSR) & 0xc00001feu)) {
++		printf("SWEET GPU: CP context/stream setup failed\n");
++		return false;
++	}
++	printf("SWEET GPU: CP memory setup complete CB%u ASID%u SID0 SMR%u TTBR=%#llx FSR=%#x; ATOS disabled by DT\n",
++	    CP_CB, CP_ASID, CP_SMR, ttbr, gpu_rd(cb, SMMU_CB_FSR));
++	sweet_log_sync();
++	return true;
++}
++/* End CP memory stage. */
++
+ static void
+ gpu_smmu_cb_faults(void)
+ {
+@@ -1515,6 +1743,11 @@
+ 			printf("SWEET GPU: GMU not booted (sweetgpu=5 boots it without a routed SMR)\n");
+ 			return;
+ 		}
++		if (mode >= 8 && !gpu_cp_memory_setup()) {
++			printf("SWEET GPU: CP memory setup failed; GPU test stopped\n");
++			sweet_log_sync();
++			return;
++		}
+ 		/* sweetgpu=6: KGSL has the DCVS votes from probe; GX rail and SPTPRAC precede HFI. */
+ 		if (mode >= 6 && !gpu_dcvs_votes()) {
+ 			printf("SWEET GPU: no DCVS votes; GMU not booted\n");
