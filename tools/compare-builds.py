@@ -69,10 +69,14 @@ def main():
     parser.add_argument('--old-boot', type=Path)
     parser.add_argument('--new-boot', type=Path)
     parser.add_argument('--added-call', action='append', default=[], metavar='CALLER:TARGET')
+    parser.add_argument('--reordered-calls', action='append', default=[],
+                        metavar='CALLER:FIRST:SECOND',
+                        help='require SECOND before FIRST in old code, FIRST before SECOND in new code')
     parser.add_argument('--new-string', action='append', default=[])
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
-    require(args.added_call or args.new_string, 'specify evidence of the intended change')
+    require(args.added_call or args.reordered_calls or args.new_string,
+            'specify evidence of the intended change')
     require(bool(args.old_boot) == bool(args.new_boot), 'provide both boot images')
     old, new = args.old_kernel.read_bytes(), args.new_kernel.read_bytes()
     require(old != new, 'old and new kernels are identical')
@@ -82,7 +86,7 @@ def main():
         value = marker.encode()
         require(value not in old and value in new, f'expected a newly added string: {marker}')
         report['evidence'].append({'new_string': marker})
-    if args.added_call:
+    if args.added_call or args.reordered_calls:
         tool = shutil.which('llvm-objdump')
         require(tool, 'llvm-objdump is required for call comparisons')
         for spec in args.added_call:
@@ -94,6 +98,31 @@ def main():
             require(re.search(pattern, after), f'new kernel does not call {target} from {caller}')
             report['evidence'].append({'added_call': spec,
                 'new_instruction': next(line.strip() for line in after.splitlines() if re.search(pattern, line)),
+                'disassembly_diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                                               fromfile='old', tofile='new'))})
+        for spec in args.reordered_calls:
+            caller, first, second = spec.split(':', 2)
+            before = disassemble(tool, args.old_kernel, caller)
+            after = disassemble(tool, args.new_kernel, caller)
+            positions = []
+            instructions = []
+            for label, code in [('old', before), ('new', after)]:
+                calls = []
+                for target in (first, second):
+                    pattern = r'\b(?:bl|b)\s+[^\n]*<' + re.escape(target) + r'>'
+                    found = re.search(pattern, code)
+                    require(found, f'{label} kernel: missing {caller} -> {target}')
+                    calls.append(found.start())
+                positions.append(calls)
+                instructions.append([code[:p].splitlines()[-1].strip() + code[p:].splitlines()[0]
+                                     for p in calls])
+            require(positions[0][1] < positions[0][0],
+                    f'old kernel does not call {second} before {first}')
+            require(positions[1][0] < positions[1][1],
+                    f'new kernel does not call {first} before {second}')
+            report['evidence'].append({'reordered_calls': spec,
+                'old_first_occurrences': instructions[0], 'new_first_occurrences': instructions[1],
+                'new_instruction': f'{caller}: {first} now precedes {second}',
                 'disassembly_diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                                                fromfile='old', tofile='new'))})
     if args.new_boot:
