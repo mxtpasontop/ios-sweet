@@ -71,7 +71,7 @@ def main():
     parser.add_argument('--added-call', action='append', default=[], metavar='CALLER:TARGET')
     parser.add_argument('--reordered-calls', action='append', default=[],
                         metavar='CALLER:FIRST:SECOND',
-                        help='require SECOND before FIRST in old code, FIRST before SECOND in new code')
+                        help='require reversed first-call instruction layout; review branches for execution order')
     parser.add_argument('--new-string', action='append', default=[])
     parser.add_argument('--report', type=Path)
     args = parser.parse_args()
@@ -114,15 +114,16 @@ def main():
                     require(found, f'{label} kernel: missing {caller} -> {target}')
                     calls.append(found.start())
                 positions.append(calls)
-                instructions.append([code[:p].splitlines()[-1].strip() + code[p:].splitlines()[0]
+                instructions.append([(code[:p].rsplit('\n', 1)[-1] + code[p:].splitlines()[0]).strip()
                                      for p in calls])
             require(positions[0][1] < positions[0][0],
                     f'old kernel does not call {second} before {first}')
             require(positions[1][0] < positions[1][1],
                     f'new kernel does not call {first} before {second}')
             report['evidence'].append({'reordered_calls': spec,
+                'instruction_layout_only': True,
                 'old_first_occurrences': instructions[0], 'new_first_occurrences': instructions[1],
-                'new_instruction': f'{caller}: {first} now precedes {second}',
+                'new_instruction': f'{caller}: first {first} instruction now precedes {second}; review control flow',
                 'disassembly_diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                                                fromfile='old', tofile='new'))})
     if args.new_boot:
