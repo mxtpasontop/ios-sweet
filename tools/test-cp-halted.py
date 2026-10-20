@@ -16,17 +16,19 @@ CORE = r'''
 static _Alignas(8) uint32_t core[GPU_SIZE/4];
 static _Alignas(8) uint32_t gmu_registers[GMU_SIZE/4];
 static vm_offset_t gmu=(uintptr_t)gmu_registers;
-static unsigned core_writes,drop_reg,clock_writes;
-static bool gpu_map_fail,halt_fail,clock_fail,clock_corrupt;
+static unsigned core_writes,core_reads,drop_reg,clock_writes,fence_writes;
+static bool gpu_map_fail,halt_fail,clock_fail,clock_corrupt,fence_fail;
 static bool core_address(uintptr_t a){return a>=(uintptr_t)core && a<(uintptr_t)core+sizeof(core);}
 static bool gmu_address(uintptr_t a){return a>=(uintptr_t)gmu_registers && a<(uintptr_t)gmu_registers+sizeof(gmu_registers);}
-static void clock_write(uintptr_t a,uint32_t value){
+static void gmu_write(uintptr_t a,uint32_t value){
+    if(a==gmu+GMU_AO_AHB_FENCE_CTRL){CHECK(value==0);fence_writes++;if(!fence_fail)*(uint32_t*)a=0;return;}
     CHECK(a==gmu+GMU_GX_SPTPRAC_CLOCK_CONTROL);clock_writes++;
     CHECK(value==(gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]|1u));
     if(!clock_fail)*(uint32_t*)a=value^(clock_corrupt?2u:0u);
 }
 static void core_write(uintptr_t a,uint32_t value){
     unsigned reg=(a-(uintptr_t)core)/4;CHECK(!(a&3));core_writes++;
+    CHECK(gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]==0);
     CHECK(gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]&1u);
     if(reg==A6XX_CP_SQE_CNTL){CHECK(value==3);if(!halt_fail)core[reg]=3;return;}
     CHECK(core[A6XX_CP_SQE_CNTL]==3);
@@ -41,7 +43,11 @@ static void core_write(uintptr_t a,uint32_t value){
     core[reg]=drop_reg==reg?(value^1):value;
 }
 static bool gpu_poll(vm_offset_t base,uint32_t off,uint32_t mask,uint32_t want,unsigned us){
-    if(base==gmu){CHECK(off==GMU_GX_SPTPRAC_CLOCK_CONTROL && mask==1 && want==1 && us==1000);return (gpu_rd(base,off)&mask)==want;}
+    if(base==gmu){
+        CHECK(us==1000);
+        if(off==GMU_AO_AHB_FENCE_CTRL){CHECK(mask==0xffffffffu && !want);return gpu_rd(base,off)==0;}
+        CHECK(off==GMU_GX_SPTPRAC_CLOCK_CONTROL && mask==1 && want==1);return (gpu_rd(base,off)&mask)==want;
+    }
     CHECK(base==(uintptr_t)core && off==A6XX_CP_SQE_CNTL*4 && mask==3 && want==3 && us==1000);
     return (gpu_rd(base,off)&mask)==want;
 }
@@ -51,13 +57,15 @@ MAIN = r'''
 static void cp_fixture(void){
     fixture();CHECK(gpu_cp_memory_setup());writes=0;
     memset(core,0,sizeof(core));memset(gmu_registers,0,sizeof(gmu_registers));
-    gmu=(uintptr_t)gmu_registers;core_writes=clock_writes=0;drop_reg=0;
-    gpu_map_fail=halt_fail=clock_fail=clock_corrupt=false;
+    gmu=(uintptr_t)gmu_registers;core_writes=core_reads=clock_writes=fence_writes=0;drop_reg=0;
+    gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]=4;
+    gpu_map_fail=halt_fail=clock_fail=clock_corrupt=fence_fail=false;
 }
 int main(void){
     cp_fixture();CHECK(gpu_cp_configure_halted());
     CHECK(!writes && core_writes==12 && core[A6XX_CP_SQE_CNTL]==3);
     CHECK(clock_writes==1 && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==1);
+    CHECK(fence_writes==1 && !gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]);
     CHECK(core[A6XX_CP_RB_BASE]==0x40000000 && core[A6XX_CP_SQE_INSTR_BASE_LO]==0x40010000);
     CHECK(core[A6XX_CP_RB_RPTR_ADDR_LO]==0x40020000 && core[A6XX_CP_RB_CNTL]==0x0800020c);
     CHECK(!core[A6XX_CP_RB_RPTR] && !core[A6XX_CP_RB_WPTR]);
@@ -74,6 +82,17 @@ int main(void){
     cp_fixture();cp_memory=0;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
     cp_fixture();map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
     cp_fixture();gpu_map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
+    cp_fixture();fence_fail=true;
+    CHECK(!gpu_cp_configure_halted() && !core_reads && !core_writes && !clock_writes && fence_writes==1);
+    cp_fixture();gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]=0;
+    gmu_registers[GMU_AHB_FENCE_RANGE_0/4]=GMU_FENCE_RANGE_MASK;
+    gmu_registers[GMU_AHB_FENCE_RANGE_1/4]=0x1234;
+    gmu_registers[GMU_AHB_FENCE_STATUS/4]=0xa5e7;
+    CHECK(gpu_cp_configure_halted() && !fence_writes);
+    CHECK(gmu_registers[GMU_AHB_FENCE_RANGE_0/4]==GMU_FENCE_RANGE_MASK &&
+        gmu_registers[GMU_AHB_FENCE_RANGE_1/4]==0x1234 && gmu_registers[GMU_AHB_FENCE_STATUS/4]==0xa5e7);
+    cp_fixture();gpu_cp_diagnostics((uintptr_t)core,"closed-fence model");
+    CHECK(!core_reads && !core_writes && !clock_writes && !fence_writes && !writes);
     cp_fixture();gmu=0;CHECK(!gpu_cp_configure_halted() && !core_writes && !clock_writes);
     cp_fixture();clock_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && clock_writes==1);
     cp_fixture();clock_corrupt=true;CHECK(!gpu_cp_configure_halted() && !core_writes && clock_writes==1);
@@ -109,7 +128,7 @@ int main(void){
     cp_fixture();core[A6XX_CP_INTERRUPT_STATUS]=1;CHECK(!gpu_cp_configure_halted() && !writes);
     cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x400;CHECK(gpu_cp_configure_halted());
     free(storage);
-    puts("Halted CP tests: SP clock dependency/bit preservation/failures, context, halt, register readbacks and read-only post-PAS comparison passed; no engine/WPTR writes");
+    puts("Halted CP tests: powered AHB access, unchanged ranges/drop evidence, read-only diagnostics, SP clock, context/halt/register failures passed; no engine/WPTR writes");
 }
 '''
 
@@ -134,9 +153,9 @@ def main():
         model = model.replace('CHECK(pa==SMMU_PA && size==SMMU_SIZE);',
                               'if(pa==GPU_PA){CHECK(size==GPU_SIZE);return gpu_map_fail?0:(uintptr_t)core;}CHECK(pa==SMMU_PA && size==SMMU_SIZE);')
         model = model.replace('uintptr_t a=base+off;CHECK(',
-                              'uintptr_t a=base+off;if(core_address(a)||gmu_address(a))return *(uint32_t*)a;CHECK(', 1)
+                              'uintptr_t a=base+off;if(core_address(a)){CHECK(!gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]);core_reads++;return *(uint32_t*)a;}if(gmu_address(a))return *(uint32_t*)a;CHECK(', 1)
         model = model.replace('uintptr_t a=base+off;unsigned absolute=',
-                              'uintptr_t a=base+off;if(core_address(a)){core_write(a,value);return;}if(gmu_address(a)){clock_write(a,value);return;}unsigned absolute=', 1)
+                              'uintptr_t a=base+off;if(core_address(a)){core_write(a,value);return;}if(gmu_address(a)){gmu_write(a,value);return;}unsigned absolute=', 1)
         c = d / 'test.c'
         c.write_text(memory.PRELUDE + defines + '\n' + CORE + body + halted + model + MAIN)
         exe = d / 'test'

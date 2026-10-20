@@ -1,0 +1,107 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -202,6 +202,9 @@
+ #define GMU_GENERAL_7_REG       GMU_REG(0x1f9cc)
+ #define GMU_AO_HOST_INTERRUPT_STATUS GMU_REG(0x23b05)
+ #define GMU_AHB_FENCE_RANGE_0   GMU_REG(0x23b11)
++#define GMU_AO_AHB_FENCE_CTRL   GMU_REG(0x23b10)
++#define GMU_AHB_FENCE_RANGE_1   GMU_REG(0x23b12)
++#define GMU_AHB_FENCE_STATUS    GMU_REG(0x23b13)
+ #define GMU_TCM_BOOT            2
+ #define GMU_FENCE_RANGE_MASK    ((1u << 31) | ((0xau << 2) << 18) | 0x8a0u)
+ #define GMU_RPMH_ENABLE_MASK    0xf11u          /* interface, LLC, DDR, MX, CX, GFX votes */
+@@ -1184,6 +1187,8 @@
+ #define A6XX_CP_SQE_CNTL           0x808u
+ #define A6XX_CP_HW_FAULT           0x821u
+ #define A6XX_CP_INTERRUPT_STATUS   0x823u
++#define A6XX_CP_PROTECT_STATUS     0x824u
++#define A6XX_CP_STATUS_1           0x825u
+ #define A6XX_CP_ROQ_THRESHOLDS_1   0x8c1u
+ #define A6XX_CP_ROQ_THRESHOLDS_2   0x8c2u
+ #define A6XX_CP_MEM_POOL_SIZE      0x8c3u
+@@ -1194,6 +1199,48 @@
+  * Bit27 disables automatic RPTR shadow writes for this first register test.
+  */
+ #define CP_RING_CNTL ((1u << 27) | (2u << 8) | 12u)
++
++static bool
++gpu_cp_register_access(void)
++{
++	if (!gmu) {
++		return false;
++	}
++	/* Normal powered register access: phone a6xx_gmu_snapshot checks GX on,
++	 * then selects ALLOW before GX reads. Never change the fence ranges or
++	 * clear dropped-write evidence here. The caller holds powered GX OOB.
++	 */
++	uint32_t before = gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL);
++	printf("SWEET GPU: CP AHB fence before ctrl=%#x range0=%#x range1=%#x status=%#x\n",
++	    before, gpu_rd(gmu, GMU_AHB_FENCE_RANGE_0), gpu_rd(gmu, GMU_AHB_FENCE_RANGE_1),
++	    gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
++	sweet_log_sync();
++	if (before) {
++		gpu_wr(gmu, GMU_AO_AHB_FENCE_CTRL, 0);
++	}
++	bool allow = gpu_poll(gmu, GMU_AO_AHB_FENCE_CTRL, 0xffffffffu, 0, 1000);
++	printf("SWEET GPU: CP AHB fence ALLOW=%u ctrl=%#x status=%#x\n", allow,
++	    gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL), gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
++	sweet_log_sync();
++	return allow;
++}
++
++static void
++gpu_cp_diagnostics(vm_offset_t gpu, const char *phase)
++{
++	uint32_t fence = gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL);
++	printf("SWEET GPU: CP diagnostic %s fence=%#x dropped=%#x\n", phase,
++	    fence, gpu_rd(gmu, GMU_AHB_FENCE_STATUS));
++	/* Do not issue more core reads if the firmware closed its AHB access. */
++	if (!fence) {
++		printf("SWEET GPU: CP diagnostic %s SQE=%#x HW_FAULT=%#x CP_IRQ=%#x PROTECT=%#x CP_STATUS=%#x RBBM_STATUS=%#x RBBM_IRQ=%#x\n",
++		    phase, gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_HW_FAULT * 4),
++		    gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4), gpu_rd(gpu, A6XX_CP_PROTECT_STATUS * 4),
++		    gpu_rd(gpu, A6XX_CP_STATUS_1 * 4), gpu_rd(gpu, A6XX_RBBM_STATUS * 4),
++		    gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
++	}
++	sweet_log_sync();
++}
+ 
+ static bool
+ gpu_cp_clock_enable(vm_offset_t gpu)
+@@ -1258,10 +1305,15 @@
+ 		printf("SWEET GPU: CP register setup prerequisite failed\n");
+ 		return false;
+ 	}
++	if (!gpu_cp_register_access()) {
++		printf("SWEET GPU: CP AHB access not ready; setup stopped\n");
++		return false;
++	}
+ 	if (!gpu_cp_clock_enable(gpu)) {
+ 		printf("SWEET GPU: CP SP clock enable failed; setup stopped\n");
+ 		return false;
+ 	}
++	gpu_cp_diagnostics(gpu, "before halt");
+ 	printf("SWEET GPU: CP before halt SQE_CNTL=%#x RB=%#x/%#x SQE=%#x/%#x RPTR=%#x WPTR=%#x\n",
+ 	    gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_BASE * 4),
+ 	    gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4), gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4),
+@@ -1271,8 +1323,10 @@
+ 	gpu_wr(gpu, A6XX_CP_SQE_CNTL * 4, 3);
+ 	if (!gpu_poll(gpu, A6XX_CP_SQE_CNTL * 4, 3, 3, 1000)) {
+ 		printf("SWEET GPU: CP halt readback failed\n");
+-		return false;
+-	}
++		gpu_cp_diagnostics(gpu, "halt failed");
++		return false;
++	}
++	gpu_cp_diagnostics(gpu, "after halt");
+ 	/* A cold, unsubmitted ring is required; do not overwrite inherited work. */
+ 	if (gpu_rd(gpu, A6XX_CP_RB_BASE * 4) || gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) ||
+ 	    gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4) ||
+@@ -1303,6 +1357,7 @@
+ 		printf("SWEET GPU: CP reg[%#x] wrote=%#x read=%#x\n", setup[i].reg, setup[i].value, got);
+ 		if (got != setup[i].value) {
+ 			printf("SWEET GPU: CP halted configuration readback mismatch\n");
++			gpu_cp_diagnostics(gpu, "register mismatch");
+ 			return false;
+ 		}
+ 	}
