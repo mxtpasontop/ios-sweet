@@ -1,0 +1,85 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,7 +45,7 @@
+  *               on (requires sweetscm=4). No CP commands are submitted.
+  *   sweetgpu=8  7 plus CP buffers, original SQE firmware, and SID0/CB1 tables;
+  *               readback and software walks only (DT disables ATOS).
+- *   sweetgpu=9  8 plus halted CP ring/SQE register setup after the PAS test;
++ *   sweetgpu=9  8 plus halted CP ring/SQE register setup before the PAS test;
+  *               SQE stays halted and no commands are submitted.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -1213,7 +1213,7 @@
+ 	    gpu_rd(smmu, SMMU_S2CR(0)) == S2CR_TRANS_CB(0) &&
+ 	    gpu_rd(smmu, SMMU_S2CR(1)) == S2CR_TRANS_CB(0) &&
+ 	    !(fsr & 0xc00001feu) && !gfsr;
+-	printf("SWEET GPU: CP post-PAS context %s FSR=%#x GFSR=%#x TTBR=%#x%08x\n",
++	printf("SWEET GPU: CP context %s FSR=%#x GFSR=%#x TTBR=%#x%08x\n",
+ 	    ok ? "intact" : "changed/faulted", fsr, gfsr,
+ 	    gpu_rd(cb, SMMU_CB_TTBR0 + 4), gpu_rd(cb, SMMU_CB_TTBR0));
+ 	return ok;
+@@ -1292,6 +1292,33 @@
+ }
+ /* End halted CP register stage. */
+ 
++/* Read-only post-PAS comparison. No reprogramming after the signed test. */
++static bool
++gpu_cp_post_pas_check(void)
++{
++	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (!gpu || !smmu) {
++		return false;
++	}
++	uint32_t halt = gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4);
++	uint32_t roq = gpu_rd(gpu, A6XX_CP_ROQ_THRESHOLDS_2 * 4);
++	uint32_t ring = gpu_rd(gpu, A6XX_CP_RB_BASE * 4);
++	uint32_t sqe = gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4);
++	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
++	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
++	printf("SWEET GPU: CP post-PAS snapshot halt=%#x ROQ2=%#x ring=%#x SQE=%#x fault=%#x irq=%#x\n",
++	    halt, roq, ring, sqe, fault, irq);
++	bool ok = halt == 3 && roq == 0x010000c0 && ring == cp_buffers[0].va && sqe == cp_buffers[1].va &&
++	    !gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) &&
++	    !gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4) &&
++	    !gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) && !gpu_rd(gpu, A6XX_CP_RB_WPTR * 4) &&
++	    !fault && !irq && gpu_cp_context_intact(smmu);
++	sweet_log_sync();
++	return ok;
++}
++/* End post-PAS CP comparison. */
++
+ static void
+ gpu_smmu_cb_faults(void)
+ {
+@@ -1726,6 +1753,19 @@
+ 		(void)gpu_report(&gx_gdscr);
+ 		gpu_report_gmu(gx_gdscr);
+ 		sweet_log_sync();
++		/* Match phone a6xx_start -> microcode_load order. Still no SQE start.
++		 * 0094's post-shutdown ROQ2 write read back zero; isolate PAS ordering
++		 * before changing clocks, permissions, or register acceptance rules.
++		 */
++		if (cp && (gx_gdscr & GDSC_PWR_ON)) {
++			printf("SWEET GPU: CP pre-PAS halted setup (phone driver order)\n");
++			sweet_log_sync();
++			if (!gpu_cp_configure_halted()) {
++				printf("SWEET GPU: CP pre-PAS setup failed; retaining GX/GMU until reset\n");
++				sweet_log_sync();
++				return false;
++			}
++		}
+ 		if (zap) {
+ 			if (!(gx_gdscr & GDSC_PWR_ON)) {
+ 				printf("SWEET GPU: zap skipped: GX not powered\n");
+@@ -1736,8 +1776,8 @@
+ 				return false;
+ 			}
+ 		}
+-		if (cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_configure_halted()) {
+-			printf("SWEET GPU: CP setup failed; retaining GX/GMU until reset\n");
++		if (cp && (gx_gdscr & GDSC_PWR_ON) && !gpu_cp_post_pas_check()) {
++			printf("SWEET GPU: CP post-PAS state changed; retaining GX/GMU until reset\n");
+ 			sweet_log_sync();
+ 			return false;
+ 		}

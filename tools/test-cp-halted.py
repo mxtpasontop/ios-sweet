@@ -48,6 +48,16 @@ int main(void){
     CHECK(core[A6XX_CP_RB_BASE]==0x40000000 && core[A6XX_CP_SQE_INSTR_BASE_LO]==0x40010000);
     CHECK(core[A6XX_CP_RB_RPTR_ADDR_LO]==0x40020000 && core[A6XX_CP_RB_CNTL]==0x0800020c);
     CHECK(!core[A6XX_CP_RB_RPTR] && !core[A6XX_CP_RB_WPTR]);
+    unsigned before=core_writes;CHECK(gpu_cp_post_pas_check() && core_writes==before && !writes);
+    const unsigned changed[]={A6XX_CP_SQE_CNTL,A6XX_CP_ROQ_THRESHOLDS_2,A6XX_CP_RB_BASE,
+        A6XX_CP_SQE_INSTR_BASE_LO,A6XX_CP_RB_BASE_HI,A6XX_CP_SQE_INSTR_BASE_LO+1,
+        A6XX_CP_RB_RPTR,A6XX_CP_RB_WPTR,A6XX_CP_HW_FAULT,A6XX_CP_INTERRUPT_STATUS};
+    for(unsigned i=0;i<sizeof(changed)/sizeof(changed[0]);i++){
+        cp_fixture();CHECK(gpu_cp_configure_halted());core[changed[i]]^=1;before=core_writes;
+        CHECK(!gpu_cp_post_pas_check() && core_writes==before && !writes);
+    }
+    cp_fixture();CHECK(gpu_cp_configure_halted());hw[SMMU_SMR(CP_SMR)/4]=0;
+    before=core_writes;CHECK(!gpu_cp_post_pas_check() && core_writes==before && !writes);
     cp_fixture();cp_memory=0;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
     cp_fixture();map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
     cp_fixture();gpu_map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
@@ -79,7 +89,7 @@ int main(void){
     cp_fixture();core[A6XX_CP_INTERRUPT_STATUS]=1;CHECK(!gpu_cp_configure_halted() && !writes);
     cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x400;CHECK(gpu_cp_configure_halted());
     free(storage);
-    puts("Halted CP tests: post-PAS context, halt, inherited work, all register readbacks and faults passed; no engine/WPTR writes");
+    puts("Halted CP tests: context, halt, inherited work, all register readbacks, faults and read-only post-PAS comparison passed; no engine/WPTR writes");
 }
 '''
 
@@ -98,6 +108,7 @@ def main():
         defines = '\n'.join(re.findall(r'^#define .*$', src.replace('\\\n', ''), re.M))
         body = src[src.index('/* CP memory stage:'):src.index('/* End CP memory stage. */')]
         halted = src[src.index('/* Halted register stage.'):src.index('/* End halted CP register stage. */')]
+        halted += src[src.index('/* Read-only post-PAS comparison.'):src.index('/* End post-PAS CP comparison. */')]
         body = re.sub(r'__asm__ volatile\s*\("[^"]*"\s*:::\s*"memory"\);', '', body)
         model = memory.MODEL[:memory.MODEL.index('int main(')]
         model = model.replace('CHECK(pa==SMMU_PA && size==SMMU_SIZE);',
