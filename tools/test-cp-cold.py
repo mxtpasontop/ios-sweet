@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise actual halted CP setup against a register model, with fault injection."""
+"""Exercise cold CP setup; SQE control writes and fault clearing are forbidden."""
 from pathlib import Path
 import importlib.util
 import os
@@ -17,7 +17,7 @@ static _Alignas(8) uint32_t core[GPU_SIZE/4];
 static _Alignas(8) uint32_t gmu_registers[GMU_SIZE/4];
 static vm_offset_t gmu=(uintptr_t)gmu_registers;
 static unsigned core_writes,core_reads,drop_reg,clock_writes,fence_writes;
-static bool gpu_map_fail,halt_fail,clock_fail,clock_corrupt,fence_fail;
+static bool gpu_map_fail,clock_fail,clock_corrupt,fence_fail;
 static bool core_address(uintptr_t a){return a>=(uintptr_t)core && a<(uintptr_t)core+sizeof(core);}
 static bool gmu_address(uintptr_t a){return a>=(uintptr_t)gmu_registers && a<(uintptr_t)gmu_registers+sizeof(gmu_registers);}
 static void gmu_write(uintptr_t a,uint32_t value){
@@ -30,8 +30,7 @@ static void core_write(uintptr_t a,uint32_t value){
     unsigned reg=(a-(uintptr_t)core)/4;CHECK(!(a&3));core_writes++;
     CHECK(gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]==0);
     CHECK(gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]&1u);
-    if(reg==A6XX_CP_SQE_CNTL){CHECK(value==3);if(!halt_fail)core[reg]=3;return;}
-    CHECK(core[A6XX_CP_SQE_CNTL]==3);
+    CHECK(reg!=A6XX_CP_SQE_CNTL && core[A6XX_CP_SQE_CNTL]==0);
     switch(reg){
     case A6XX_CP_ROQ_THRESHOLDS_2: case A6XX_CP_ROQ_THRESHOLDS_1:
     case A6XX_CP_MEM_POOL_SIZE: case A6XX_CP_AHB_CNTL:
@@ -48,8 +47,7 @@ static bool gpu_poll(vm_offset_t base,uint32_t off,uint32_t mask,uint32_t want,u
         if(off==GMU_AO_AHB_FENCE_CTRL){CHECK(mask==0xffffffffu && !want);return gpu_rd(base,off)==0;}
         CHECK(off==GMU_GX_SPTPRAC_CLOCK_CONTROL && mask==1 && want==1);return (gpu_rd(base,off)&mask)==want;
     }
-    CHECK(base==(uintptr_t)core && off==A6XX_CP_SQE_CNTL*4 && mask==3 && want==3 && us==1000);
-    return (gpu_rd(base,off)&mask)==want;
+    CHECK(!"cold CP stage must not poll SQE control");return false;
 }
 '''
 
@@ -59,11 +57,11 @@ static void cp_fixture(void){
     memset(core,0,sizeof(core));memset(gmu_registers,0,sizeof(gmu_registers));
     gmu=(uintptr_t)gmu_registers;core_writes=core_reads=clock_writes=fence_writes=0;drop_reg=0;
     gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]=4;
-    gpu_map_fail=halt_fail=clock_fail=clock_corrupt=fence_fail=false;
+    gpu_map_fail=clock_fail=clock_corrupt=fence_fail=false;
 }
 int main(void){
-    cp_fixture();CHECK(gpu_cp_configure_halted());
-    CHECK(!writes && core_writes==12 && core[A6XX_CP_SQE_CNTL]==3);
+    cp_fixture();CHECK(gpu_cp_configure_cold());
+    CHECK(!writes && core_writes==11 && core[A6XX_CP_SQE_CNTL]==0);
     CHECK(clock_writes==1 && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==1);
     CHECK(fence_writes==1 && !gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]);
     CHECK(core[A6XX_CP_RB_BASE]==0x40000000 && core[A6XX_CP_SQE_INSTR_BASE_LO]==0x40010000);
@@ -74,32 +72,32 @@ int main(void){
         A6XX_CP_SQE_INSTR_BASE_LO,A6XX_CP_RB_BASE_HI,A6XX_CP_SQE_INSTR_BASE_LO+1,
         A6XX_CP_RB_RPTR,A6XX_CP_RB_WPTR,A6XX_CP_HW_FAULT,A6XX_CP_INTERRUPT_STATUS};
     for(unsigned i=0;i<sizeof(changed)/sizeof(changed[0]);i++){
-        cp_fixture();CHECK(gpu_cp_configure_halted());core[changed[i]]^=1;before=core_writes;
+        cp_fixture();CHECK(gpu_cp_configure_cold());core[changed[i]]^=1;before=core_writes;
         CHECK(!gpu_cp_post_pas_check() && core_writes==before && !writes);
     }
-    cp_fixture();CHECK(gpu_cp_configure_halted());hw[SMMU_SMR(CP_SMR)/4]=0;
+    cp_fixture();CHECK(gpu_cp_configure_cold());hw[SMMU_SMR(CP_SMR)/4]=0;
     before=core_writes;CHECK(!gpu_cp_post_pas_check() && core_writes==before && !writes);
-    cp_fixture();cp_memory=0;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
-    cp_fixture();map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
-    cp_fixture();gpu_map_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && !writes);
+    cp_fixture();cp_memory=0;CHECK(!gpu_cp_configure_cold() && !core_writes && !writes);
+    cp_fixture();map_fail=true;CHECK(!gpu_cp_configure_cold() && !core_writes && !writes);
+    cp_fixture();gpu_map_fail=true;CHECK(!gpu_cp_configure_cold() && !core_writes && !writes);
     cp_fixture();fence_fail=true;
-    CHECK(!gpu_cp_configure_halted() && !core_reads && !core_writes && !clock_writes && fence_writes==1);
+    CHECK(!gpu_cp_configure_cold() && !core_reads && !core_writes && !clock_writes && fence_writes==1);
     cp_fixture();gmu_registers[GMU_AO_AHB_FENCE_CTRL/4]=0;
     gmu_registers[GMU_AHB_FENCE_RANGE_0/4]=GMU_FENCE_RANGE_MASK;
     gmu_registers[GMU_AHB_FENCE_RANGE_1/4]=0x1234;
     gmu_registers[GMU_AHB_FENCE_STATUS/4]=0xa5e7;
-    CHECK(gpu_cp_configure_halted() && !fence_writes);
+    CHECK(gpu_cp_configure_cold() && !fence_writes);
     CHECK(gmu_registers[GMU_AHB_FENCE_RANGE_0/4]==GMU_FENCE_RANGE_MASK &&
         gmu_registers[GMU_AHB_FENCE_RANGE_1/4]==0x1234 && gmu_registers[GMU_AHB_FENCE_STATUS/4]==0xa5e7);
     cp_fixture();gpu_cp_diagnostics((uintptr_t)core,"closed-fence model");
     CHECK(!core_reads && !core_writes && !clock_writes && !fence_writes && !writes);
-    cp_fixture();gmu=0;CHECK(!gpu_cp_configure_halted() && !core_writes && !clock_writes);
-    cp_fixture();clock_fail=true;CHECK(!gpu_cp_configure_halted() && !core_writes && clock_writes==1);
-    cp_fixture();clock_corrupt=true;CHECK(!gpu_cp_configure_halted() && !core_writes && clock_writes==1);
+    cp_fixture();gmu=0;CHECK(!gpu_cp_configure_cold() && !core_writes && !clock_writes);
+    cp_fixture();clock_fail=true;CHECK(!gpu_cp_configure_cold() && !core_writes && clock_writes==1);
+    cp_fixture();clock_corrupt=true;CHECK(!gpu_cp_configure_cold() && !core_writes && clock_writes==1);
     cp_fixture();gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]=0xa0;
-    CHECK(gpu_cp_configure_halted() && clock_writes==1 && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==0xa1);
+    CHECK(gpu_cp_configure_cold() && clock_writes==1 && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==0xa1);
     cp_fixture();gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]=0xa1;
-    CHECK(gpu_cp_configure_halted() && !clock_writes && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==0xa1);
+    CHECK(gpu_cp_configure_cold() && !clock_writes && gmu_registers[GMU_GX_SPTPRAC_CLOCK_CONTROL/4]==0xa1);
     const unsigned context[]={SMMU_CB(CP_CB)+SMMU_CB_SCTLR,SMMU_CB(CP_CB)+SMMU_CB_TCR,
         SMMU_CB(CP_CB)+SMMU_CB_TTBCR2,SMMU_CB(CP_CB)+SMMU_CB_TTBR0,SMMU_CB(CP_CB)+SMMU_CB_TTBR0+4,
         SMMU_CB(CP_CB)+SMMU_CB_MAIR0,SMMU_CB(CP_CB)+SMMU_CB_MAIR1,
@@ -107,34 +105,37 @@ int main(void){
         SMMU_SMR(CP_SMR),SMMU_S2CR(CP_SMR),SMMU_SMR(0),SMMU_SMR(1),SMMU_S2CR(0),SMMU_S2CR(1)};
     for(unsigned i=0;i<sizeof(context)/sizeof(context[0]);i++){
         cp_fixture();unsigned bit=context[i]==SMMU_GR1+SMMU_CBAR(CP_CB)?0x10000:1;
-        hw[context[i]/4]^=bit;CHECK(!gpu_cp_configure_halted() && !writes && !core_writes);
+        hw[context[i]/4]^=bit;CHECK(!gpu_cp_configure_cold() && !writes && !core_writes);
     }
-    cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x402;CHECK(!gpu_cp_configure_halted() && !core_writes);
-    cp_fixture();hw[SMMU_sGFSR/4]=1;CHECK(!gpu_cp_configure_halted() && !core_writes);
-    cp_fixture();cp_write64(cp_memory,CP_L3,0);CHECK(!gpu_cp_configure_halted() && !core_writes);
-    cp_fixture();halt_fail=true;CHECK(!gpu_cp_configure_halted() && core_writes==1 && !writes);
+    cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x402;CHECK(!gpu_cp_configure_cold() && !core_writes);
+    cp_fixture();hw[SMMU_sGFSR/4]=1;CHECK(!gpu_cp_configure_cold() && !core_writes);
+    cp_fixture();cp_write64(cp_memory,CP_L3,0);CHECK(!gpu_cp_configure_cold() && !core_writes);
+    cp_fixture();core[A6XX_CP_INTERRUPT_STATUS]=0x80;
+    CHECK(!gpu_cp_configure_cold() && !core_writes && !writes && core[A6XX_CP_INTERRUPT_STATUS]==0x80);
+    cp_fixture();core[A6XX_CP_SQE_CNTL]=3;
+    CHECK(!gpu_cp_configure_cold() && !core_writes && !writes && core[A6XX_CP_SQE_CNTL]==3);
     const unsigned inherited[]={A6XX_CP_RB_BASE,A6XX_CP_RB_BASE_HI,A6XX_CP_SQE_INSTR_BASE_LO,
-        A6XX_CP_SQE_INSTR_BASE_LO+1,A6XX_CP_RB_RPTR,A6XX_CP_RB_WPTR};
+        A6XX_CP_SQE_INSTR_BASE_LO+1,A6XX_CP_RB_RPTR,A6XX_CP_RB_WPTR,A6XX_CP_HW_FAULT,A6XX_CP_INTERRUPT_STATUS};
     for(unsigned i=0;i<sizeof(inherited)/sizeof(inherited[0]);i++){
-        cp_fixture();core[inherited[i]]=1;CHECK(!gpu_cp_configure_halted() && core_writes==1 && !writes);
+        cp_fixture();core[inherited[i]]=1;CHECK(!gpu_cp_configure_cold() && !core_writes && !writes);
     }
     const unsigned readbacks[]={A6XX_CP_ROQ_THRESHOLDS_2,A6XX_CP_ROQ_THRESHOLDS_1,
         A6XX_CP_MEM_POOL_SIZE,A6XX_CP_AHB_CNTL,A6XX_CP_RB_RPTR_ADDR_LO,A6XX_CP_RB_RPTR_ADDR_HI,
         A6XX_CP_RB_CNTL,A6XX_CP_RB_BASE,A6XX_CP_RB_BASE_HI,A6XX_CP_SQE_INSTR_BASE_LO,A6XX_CP_SQE_INSTR_BASE_LO+1};
     for(unsigned i=0;i<sizeof(readbacks)/sizeof(readbacks[0]);i++){
-        cp_fixture();drop_reg=readbacks[i];CHECK(!gpu_cp_configure_halted() && !writes);
+        cp_fixture();drop_reg=readbacks[i];CHECK(!gpu_cp_configure_cold() && !writes);
     }
-    cp_fixture();core[A6XX_CP_HW_FAULT]=1;CHECK(!gpu_cp_configure_halted() && !writes);
-    cp_fixture();core[A6XX_CP_INTERRUPT_STATUS]=1;CHECK(!gpu_cp_configure_halted() && !writes);
-    cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x400;CHECK(gpu_cp_configure_halted());
+    cp_fixture();core[A6XX_CP_HW_FAULT]=1;CHECK(!gpu_cp_configure_cold() && !writes);
+    cp_fixture();core[A6XX_CP_INTERRUPT_STATUS]=1;CHECK(!gpu_cp_configure_cold() && !writes);
+    cp_fixture();hw[(SMMU_CB(CP_CB)+SMMU_CB_FSR)/4]=0x400;CHECK(gpu_cp_configure_cold());
     free(storage);
-    puts("Halted CP tests: powered AHB access, unchanged ranges/drop evidence, read-only diagnostics, SP clock, context/halt/register failures passed; no engine/WPTR writes");
+    puts("Cold CP tests: zero SQE control preserved, inherited faults retained, powered access/context/register failures passed; no SQE/WPTR or fault-clear writes");
 }
 '''
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='sweet-cp-halted-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='sweet-cp-cold-') as tmp:
         d = Path(tmp)
         (d / 'bsd/dev').mkdir(parents=True)
         for patch in sorted((ROOT / 'xnu/patches').glob('*.patch')):
@@ -146,7 +147,7 @@ def main():
         src = (d / 'bsd/dev/sweet_gpu.c').read_text()
         defines = '\n'.join(re.findall(r'^#define .*$', src.replace('\\\n', ''), re.M))
         body = src[src.index('/* CP memory stage:'):src.index('/* End CP memory stage. */')]
-        halted = src[src.index('/* Halted register stage.'):src.index('/* End halted CP register stage. */')]
+        halted = src[src.index('/* Cold register stage.'):src.index('/* End cold CP register stage. */')]
         halted += src[src.index('/* Read-only post-PAS comparison.'):src.index('/* End post-PAS CP comparison. */')]
         body = re.sub(r'__asm__ volatile\s*\("[^"]*"\s*:::\s*"memory"\);', '', body)
         model = memory.MODEL[:memory.MODEL.index('int main(')]

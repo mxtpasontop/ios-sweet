@@ -24,7 +24,7 @@ static bool gpu_report(uint32_t *v){reports++;*v=powered?GDSC_PWR_ON:0;return tr
 static void gpu_report_gmu(uint32_t v){CHECK(v==(powered?GDSC_PWR_ON:0));}
 static void sweet_log_sync(void){syncs++;}
 static bool sweet_scm_gpu_zap_test(void){CHECK(ack && powered && !clears && !slumbers);calls++;return stopped;}
-static bool gpu_cp_configure_halted(void){CHECK(ack && powered && !calls && !clears && !slumbers);configs++;return configured;}
+static bool gpu_cp_configure_cold(void){CHECK(ack && powered && !calls && !clears && !slumbers);configs++;return configured;}
 static bool gpu_cp_post_pas_check(void){CHECK(ack && powered && configs==1 && configured && calls==1 && stopped && !clears && !slumbers);postchecks++;return intact;}
 static void gmu_oob_clear(unsigned req){CHECK(req==(clears?OOB_BOOT_SLUMBER:OOB_GPU));clears++;}
 static void gpu_gx_slumber(void){CHECK(clears==2);slumbers++;}
@@ -41,7 +41,7 @@ int main(void){
     fixture();configured=false;CHECK(!gpu_gx_test(true,true) && !calls && configs==1 && !postchecks && !clears && !slumbers);
     fixture();stopped=false;CHECK(!gpu_gx_test(true,true) && calls==1 && configs==1 && !postchecks && !clears && !slumbers);
     fixture();intact=false;CHECK(!gpu_gx_test(true,true) && calls==1 && configs==1 && postchecks==1 && !clears && !slumbers);
-    puts("GPU zap/CP hooks: mode gates, halted CP -> PAS -> read-only comparison order, failures retaining power passed");
+    puts("GPU zap/CP hooks: mode gates, cold CP -> PAS -> read-only comparison order, failures retaining power passed");
 }
 '''
 

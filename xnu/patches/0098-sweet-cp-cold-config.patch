@@ -1,0 +1,143 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -45,8 +45,8 @@
+  *               on (requires sweetscm=4). No CP commands are submitted.
+  *   sweetgpu=8  7 plus CP buffers, original SQE firmware, and SID0/CB1 tables;
+  *               readback and software walks only (DT disables ATOS).
+- *   sweetgpu=9  8 plus halted CP ring/SQE register setup before the PAS test;
+- *               SQE stays halted and no commands are submitted.
++ *   sweetgpu=9  8 plus cold CP ring/SQE register setup before the PAS test;
++ *               SQE control stays at initial zero; no commands submitted.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -1173,9 +1173,11 @@
+ }
+ /* End CP memory stage. */
+ 
+-/* Halted register stage. Register indices are DWORDs, not byte offsets.
++/* Cold register stage. Register indices are DWORDs, not byte offsets.
+  * Phone kernel 1bc20ec6: a6xx_start, a6xx_rb_start, a6xx_microcode_load;
+- * upstream v6.1 a6xx_recover uses SQE_CNTL=3 to halt. No engine start here.
++ * configure while SQE_CNTL is still zero, before the later enable=1.
++ * 0097 showed cold SQE_CNTL=3 raises CP_IRQ bit7 before ROQ setup.
++ * Recovery's halt=3 sequence is not a cold initialization prerequisite.
+  */
+ #define A6XX_CP_RB_BASE            0x800u
+ #define A6XX_CP_RB_BASE_HI         0x801u
+@@ -1293,7 +1295,7 @@
+ }
+ 
+ static bool
+-gpu_cp_configure_halted(void)
++gpu_cp_configure_cold(void)
+ {
+ 	if (!cp_memory || !cp_memory_pa) {
+ 		printf("SWEET GPU: CP register setup missing owned memory\n");
+@@ -1313,26 +1315,23 @@
+ 		printf("SWEET GPU: CP SP clock enable failed; setup stopped\n");
+ 		return false;
+ 	}
+-	gpu_cp_diagnostics(gpu, "before halt");
+-	printf("SWEET GPU: CP before halt SQE_CNTL=%#x RB=%#x/%#x SQE=%#x/%#x RPTR=%#x WPTR=%#x\n",
++	gpu_cp_diagnostics(gpu, "cold entry");
++	printf("SWEET GPU: CP cold entry SQE_CNTL=%#x RB=%#x/%#x SQE=%#x/%#x RPTR=%#x WPTR=%#x\n",
+ 	    gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_BASE * 4),
+ 	    gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4), gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4),
+ 	    gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4),
+ 	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4), gpu_rd(gpu, A6XX_CP_RB_WPTR * 4));
+ 	sweet_log_sync();
+-	gpu_wr(gpu, A6XX_CP_SQE_CNTL * 4, 3);
+-	if (!gpu_poll(gpu, A6XX_CP_SQE_CNTL * 4, 3, 3, 1000)) {
+-		printf("SWEET GPU: CP halt readback failed\n");
+-		gpu_cp_diagnostics(gpu, "halt failed");
+-		return false;
+-	}
+-	gpu_cp_diagnostics(gpu, "after halt");
+-	/* A cold, unsubmitted ring is required; do not overwrite inherited work. */
+-	if (gpu_rd(gpu, A6XX_CP_RB_BASE * 4) || gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) ||
++	/* Do not write SQE_CNTL at all. Refuse non-cold state or existing errors;
++	 * never clear faults to make this initialization test appear successful.
++	 */
++	if (gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4) || gpu_rd(gpu, A6XX_CP_HW_FAULT * 4) ||
++	    gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4) ||
++	    gpu_rd(gpu, A6XX_CP_RB_BASE * 4) || gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) ||
+ 	    gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4) ||
+ 	    gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4) ||
+ 	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) || gpu_rd(gpu, A6XX_CP_RB_WPTR * 4)) {
+-		printf("SWEET GPU: CP has inherited ring/SQE state; setup stopped\n");
++		printf("SWEET GPU: CP has inherited state or faults; cold setup stopped\n");
+ 		return false;
+ 	}
+ 	/* a618 thresholds and pool size from the phone driver; no UCHE/rendering
+@@ -1356,26 +1355,26 @@
+ 		uint32_t got = gpu_rd(gpu, setup[i].reg * 4);
+ 		printf("SWEET GPU: CP reg[%#x] wrote=%#x read=%#x\n", setup[i].reg, setup[i].value, got);
+ 		if (got != setup[i].value) {
+-			printf("SWEET GPU: CP halted configuration readback mismatch\n");
++			printf("SWEET GPU: CP cold configuration readback mismatch\n");
+ 			gpu_cp_diagnostics(gpu, "register mismatch");
+ 			return false;
+ 		}
+ 	}
+ 	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
+ 	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
+-	printf("SWEET GPU: CP halted status SQE_CNTL=%#x RPTR=%#x WPTR=%#x HW_FAULT=%#x CP_IRQ=%#x RBBM_IRQ=%#x\n",
++	printf("SWEET GPU: CP cold status SQE_CNTL=%#x RPTR=%#x WPTR=%#x HW_FAULT=%#x CP_IRQ=%#x RBBM_IRQ=%#x\n",
+ 	    gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4), gpu_rd(gpu, A6XX_CP_RB_RPTR * 4),
+ 	    gpu_rd(gpu, A6XX_CP_RB_WPTR * 4), fault, irq, gpu_rd(gpu, A6XX_RBBM_INT_0_STATUS * 4));
+-	if (fault || irq || gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4) != 3 ||
++	if (fault || irq || gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4) ||
+ 	    gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) || gpu_rd(gpu, A6XX_CP_RB_WPTR * 4) ||
+ 	    !gpu_cp_context_intact(smmu)) {
+ 		return false;
+ 	}
+-	printf("SWEET GPU: CP halted configuration verified; no commands submitted\n");
++	printf("SWEET GPU: CP cold configuration verified; SQE control remains zero; no commands submitted\n");
+ 	sweet_log_sync();
+ 	return true;
+ }
+-/* End halted CP register stage. */
++/* End cold CP register stage. */
+ 
+ /* Read-only post-PAS comparison. No reprogramming after the signed test. */
+ static bool
+@@ -1386,15 +1385,15 @@
+ 	if (!gpu || !smmu) {
+ 		return false;
+ 	}
+-	uint32_t halt = gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4);
++	uint32_t control = gpu_rd(gpu, A6XX_CP_SQE_CNTL * 4);
+ 	uint32_t roq = gpu_rd(gpu, A6XX_CP_ROQ_THRESHOLDS_2 * 4);
+ 	uint32_t ring = gpu_rd(gpu, A6XX_CP_RB_BASE * 4);
+ 	uint32_t sqe = gpu_rd(gpu, A6XX_CP_SQE_INSTR_BASE_LO * 4);
+ 	uint32_t fault = gpu_rd(gpu, A6XX_CP_HW_FAULT * 4);
+ 	uint32_t irq = gpu_rd(gpu, A6XX_CP_INTERRUPT_STATUS * 4);
+-	printf("SWEET GPU: CP post-PAS snapshot halt=%#x ROQ2=%#x ring=%#x SQE=%#x fault=%#x irq=%#x\n",
+-	    halt, roq, ring, sqe, fault, irq);
+-	bool ok = halt == 3 && roq == 0x010000c0 && ring == cp_buffers[0].va && sqe == cp_buffers[1].va &&
++	printf("SWEET GPU: CP post-PAS snapshot SQE_CNTL=%#x ROQ2=%#x ring=%#x SQE=%#x fault=%#x irq=%#x\n",
++	    control, roq, ring, sqe, fault, irq);
++	bool ok = control == 0 && roq == 0x010000c0 && ring == cp_buffers[0].va && sqe == cp_buffers[1].va &&
+ 	    !gpu_rd(gpu, A6XX_CP_RB_BASE_HI * 4) &&
+ 	    !gpu_rd(gpu, (A6XX_CP_SQE_INSTR_BASE_LO + 1) * 4) &&
+ 	    !gpu_rd(gpu, A6XX_CP_RB_RPTR * 4) && !gpu_rd(gpu, A6XX_CP_RB_WPTR * 4) &&
+@@ -1838,14 +1837,13 @@
+ 		(void)gpu_report(&gx_gdscr);
+ 		gpu_report_gmu(gx_gdscr);
+ 		sweet_log_sync();
+-		/* Match phone a6xx_start -> microcode_load order. Still no SQE start.
+-		 * 0094's post-shutdown ROQ2 write read back zero; isolate PAS ordering
+-		 * before changing clocks, permissions, or register acceptance rules.
++		/* Match phone a6xx_start -> microcode_load order. SQE control stays
++		 * at cold zero through setup and the signed PAS test.
+ 		 */
+ 		if (cp && (gx_gdscr & GDSC_PWR_ON)) {
+-			printf("SWEET GPU: CP pre-PAS halted setup (phone driver order)\n");
++			printf("SWEET GPU: CP pre-PAS cold setup (phone driver order)\n");
+ 			sweet_log_sync();
+-			if (!gpu_cp_configure_halted()) {
++			if (!gpu_cp_configure_cold()) {
+ 				printf("SWEET GPU: CP pre-PAS setup failed; retaining GX/GMU until reset\n");
+ 				sweet_log_sync();
+ 				return false;
