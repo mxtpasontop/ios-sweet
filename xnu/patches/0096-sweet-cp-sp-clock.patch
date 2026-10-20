@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -191,6 +191,7 @@
+ #define GMU_SYS_BUS_CONFIG      GMU_REG(0x1f40f)
+ #define GMU_ICACHE_CONFIG       GMU_REG(0x1f400)
+ #define GMU_DCACHE_CONFIG       GMU_REG(0x1f401)
++#define GMU_GX_SPTPRAC_CLOCK_CONTROL GMU_REG(0x1a880)
+ #define GMU_PWR_COL_INTER_FRAME_CTRL GMU_REG(0x1f8c0)
+ #define GMU_RPMH_CTRL           GMU_REG(0x1f8e8)
+ #define GMU_PWR_COL_CP_MSG      GMU_REG(0x1f900)
+@@ -1188,10 +1189,35 @@
+ #define A6XX_CP_MEM_POOL_SIZE      0x8c3u
+ #define A6XX_CP_AHB_CNTL           0x98du
+ #define A6XX_RBBM_INT_0_STATUS     0x201u
++#define A6XX_RBBM_CLOCK_CNTL       0xaeu
+ /* 32 KiB = 8192 dwords = 4096 quadwords; 4-dword RPTR update threshold.
+  * Bit27 disables automatic RPTR shadow writes for this first register test.
+  */
+ #define CP_RING_CNTL ((1u << 27) | (2u << 8) | 12u)
++
++static bool
++gpu_cp_clock_enable(vm_offset_t gpu)
++{
++	if (!gmu) {
++		return false;
++	}
++	/* Phone a6xx_hwcg_set enables bit0 before a6xx_start configures CP.
++	 * Do not change HWCG tables here: isolate the missing SP-clock enable.
++	 * Keep GX OOB held and SQE unstarted throughout this register test.
++	 */
++	uint32_t before = gpu_rd(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL);
++	printf("SWEET GPU: CP SP clock before=%#x RBBM_CLOCK_CNTL=%#x ROQ2=%#x\n",
++	    before, gpu_rd(gpu, A6XX_RBBM_CLOCK_CNTL * 4), gpu_rd(gpu, A6XX_CP_ROQ_THRESHOLDS_2 * 4));
++	sweet_log_sync();
++	if (!(before & 1u)) {
++		gpu_wr(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, before | 1u);
++	}
++	bool enabled = gpu_poll(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, 1, 1, 1000);
++	uint32_t after = gpu_rd(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL);
++	printf("SWEET GPU: CP SP clock after=%#x expected=%#x enabled=%u\n", after, before | 1u, enabled);
++	sweet_log_sync();
++	return enabled && after == (before | 1u);
++}
+ 
+ static bool
+ gpu_cp_context_intact(vm_offset_t smmu)
+@@ -1230,6 +1256,10 @@
+ 	vm_offset_t gpu = ml_io_map(GPU_PA, GPU_SIZE);
+ 	if (!smmu || !gpu || !gpu_cp_context_intact(smmu) || !cp_check_tables()) {
+ 		printf("SWEET GPU: CP register setup prerequisite failed\n");
++		return false;
++	}
++	if (!gpu_cp_clock_enable(gpu)) {
++		printf("SWEET GPU: CP SP clock enable failed; setup stopped\n");
+ 		return false;
+ 	}
+ 	printf("SWEET GPU: CP before halt SQE_CNTL=%#x RB=%#x/%#x SQE=%#x/%#x RPTR=%#x WPTR=%#x\n",
